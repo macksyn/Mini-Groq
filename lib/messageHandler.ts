@@ -34,6 +34,10 @@ const SQLITE_URL = process.env.DB_URL;
 const HAS_DB = !!(MONGO_URL || POSTGRES_URL || MYSQL_URL || SQLITE_URL);
 const STICKER_FILE = dataFile('sticker_commands.json');
 
+function invalidateGroupCache(_groupId: string): void {
+    // Group cache invalidation stub — extend as needed
+}
+
 const processedMessageIds = new Map<string, number>();
 const MESSAGE_DEDUP_TTL_MS = 5 * 60 * 1000;
 setInterval(() => {
