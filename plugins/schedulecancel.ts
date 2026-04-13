@@ -9,13 +9,11 @@ export default {
     usage: '.schedulecancel <ID>',
 
     async handler(sock: any, message: any, args: any[], context: BotContext) {
-        const chatId = context.chatId || message.key.remoteJid;
-        const senderId = context.senderId || message.key.remoteJid;
-        const channelInfo = context.channelInfo || {};
+        const { chatId, senderId, channelInfo, senderIsOwnerOrSudo } = context;
 
         if (!args || args.length === 0) {
             return await sock.sendMessage(chatId, {
-                text: '❌ Please provide the schedule ID.\n\nUsage: `.schedulecancel <ID>`\nGet IDs: `.schedulelist`',
+                text: '❌ Please provide the schedule ID.\n\nUsage: `.schedulecancel <ID>`\nGet IDs with: `.schedulelist`',
                 ...channelInfo
             }, { quoted: message });
         }
@@ -23,13 +21,16 @@ export default {
         const targetId = args[0].toUpperCase();
         const schedules = await loadSchedules();
 
-        const index = schedules.findIndex(s =>
-            s.id === targetId && (s.chatId === chatId || s.senderId === senderId)
-        );
+        // Owners/sudo can cancel any schedule; regular users can only cancel their own
+        const index = schedules.findIndex(s => {
+            if (s.id !== targetId) return false;
+            if (senderIsOwnerOrSudo) return true;
+            return s.senderId === senderId || s.chatId === chatId || s.targetJid === chatId;
+        });
 
         if (index === -1) {
             return await sock.sendMessage(chatId, {
-                text: `❌ No scheduled message found with ID *${targetId}*\n\nUse \`.schedulelist\` to see your scheduled messages.`,
+                text: `❌ No schedule found with ID *${targetId}*, or you don't have permission to cancel it.\n\nUse \`.schedulelist\` to see your scheduled messages.`,
                 ...channelInfo
             }, { quoted: message });
         }
@@ -37,10 +38,17 @@ export default {
         const cancelled = schedules.splice(index, 1)[0];
         await saveSchedules(schedules);
 
+        const typeLabel = cancelled.mediaType
+            ? `📎 ${cancelled.mediaType}`
+            : `💬 Text: ${(cancelled.message ?? '').slice(0, 50)}`;
+
         await sock.sendMessage(chatId, {
-            text: `🗑️ *Schedule Cancelled!*\n\n📌 *ID:* ${cancelled.id}\n💬 *Message:* ${cancelled.message}`,
+            text:
+                `🗑️ *Schedule Cancelled*\n\n` +
+                `📌 *ID:* ${cancelled.id}\n` +
+                `🔁 *Was:* ${cancelled.recurrence}\n` +
+                `${typeLabel}`,
             ...channelInfo
         }, { quoted: message });
     }
 };
-
