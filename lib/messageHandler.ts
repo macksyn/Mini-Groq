@@ -16,21 +16,16 @@ import isAdmin from './isAdmin.js';
 import { handleAutoread } from '../plugins/autoread.js';
 import { handleAutotypingForMessage, showTypingAfterCommand } from '../plugins/autotyping.js';
 import { storeMessage, handleMessageRevocation } from '../plugins/antidelete.js';
-import { handleBadwordDetection } from './antibadword.js';
-import { handleLinkDetection } from '../plugins/antilink.js';
 import { handleTagDetection } from '../plugins/antitag.js';
 import { handleMentionDetection } from '../plugins/mention.js';
 import { handleChatbotResponse } from '../plugins/chatbot.js';
 import { handleLocalBotMessage } from '../plugins/localbot.js';
-import { handleTicTacToeMove } from '../plugins/tictactoe.js';
 import { handleAutoReply } from '../plugins/autoreply.js';
-import { handleAntiSpam, invalidateGroupCache } from '../plugins/antispam.js';
 import { startSchedulerEngine } from '../plugins/schedule.js';
 import { addCommandReaction } from './reactions.js';
 import { writeErrorLog } from './logger.js';
 
 import { channelInfo } from './messageConfig.js';
-import { handleAutoAttendance } from '../plugins/attendance.js';
 
 const MONGO_URL = process.env.MONGO_URL;
 const POSTGRES_URL = process.env.POSTGRES_URL;
@@ -299,16 +294,6 @@ async function handleMessages(sock: any, messageUpdate: any) {
         const senderIsSudo = await isSudo(senderId);
         startSchedulerEngine(sock);
 
-// ── Attendance auto-detection (groups only) ───────────────────────────────────
-        if (isGroup && !message.key.fromMe && /GIST\s+HQ/i.test(rawText)) {
-            try {
-                const handled = await handleAutoAttendance(message, sock);
-                if (handled) return;
-            } catch (e: any) {
-                printLog('error', `[ATTENDANCE] Auto-detection failed: ${e.message}`);
-            }
-        }
-
         if (!message.key.fromMe) {
             const replied = await handleAutoReply(sock, chatId, message, userMessage);
             if (replied) return;
@@ -352,11 +337,6 @@ async function handleMessages(sock: any, messageUpdate: any) {
             return;
         }
 
-        if (/^[1-9]$/.test(userMessage) || userMessage === 'surrender') {
-            await handleTicTacToeMove(sock, chatId, senderId, userMessage);
-            return;
-        }
-
         if (!message.key.fromMe) {
             await store.incrementMessageCount(chatId, senderId, message.pushName);
         } else {
@@ -374,19 +354,6 @@ async function handleMessages(sock: any, messageUpdate: any) {
             } catch (e: any) {
                 printLog('error', `[ACTIVITY] Tracking error: ${e.message}`);
             }
-        }
-
-        if (isGroup) {
-            if (userMessage) {
-                await handleBadwordDetection(sock, chatId, message, userMessage, senderId);
-            }
-            await handleLinkDetection(sock, chatId, message, userMessage, senderId);
-        }
-
-        // Anti-spam flood detection
-        if (isGroup && !message.key.fromMe) {
-            const spammed = await handleAntiSpam(sock, chatId, message, senderId, senderIsOwnerOrSudo);
-            if (spammed) return;
         }
 
         if (!isGroup && !message.key.fromMe && !senderIsSudo) {
