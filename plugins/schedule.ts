@@ -292,7 +292,6 @@ export const schedules = [
             console.error('[SCHEDULE] Engine error:', e.message);
         }
     }, 10_000);
-}
 
 // ── Command handler ────────────────────────────────────────────────────────────
 
