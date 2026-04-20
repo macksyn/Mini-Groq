@@ -21,7 +21,6 @@ import { handleMentionDetection } from '../plugins/mention.js';
 import { handleChatbotResponse } from '../plugins/chatbot.js';
 import { handleLocalBotMessage } from '../plugins/localbot.js';
 import { handleAutoReply } from '../plugins/autoreply.js';
-import { startSchedulerEngine } from '../plugins/schedule.js';
 import { addCommandReaction } from './reactions.js';
 import { writeErrorLog } from './logger.js';
 
