@@ -164,26 +164,68 @@ function parseArgs(args: string[]): {
     return { time, recurrence, targetJid, messageText: args.slice(i).join(' ').trim() };
 }
 
-// ── Scheduler Engine ───────────────────────────────────────────────────────────
+// Remove these entirely:
+// let _engineStarted = false;
+// export function startSchedulerEngine(sock: any): void { ... }
 
-let _engineStarted = false;
+// Add this named export instead:
+export const schedules = [
+    {
+        every: 10_000,
+        handler: async (sock: any) => {
+            try {
+                const now = Date.now();
+                const schedules = await loadSchedules();
+                const remaining: ScheduledMessage[] = [];
+                let changed = false;
 
-export function startSchedulerEngine(sock: any): void {
-    if (_engineStarted) return;
-    _engineStarted = true;
+                for (const item of schedules) {
+                    if (now < item.sendAt) {
+                        remaining.push(item);
+                        continue;
+                    }
 
-    setInterval(async () => {
-        try {
-            const now = Date.now();
-            const schedules = await loadSchedules();
-            const remaining: ScheduledMessage[] = [];
-            let changed = false;
+                    try {
+                        if (item.mediaType && item.mediaBase64) {
+                            const buf = Buffer.from(item.mediaBase64, 'base64');
+                            const payload: Record<string, any> = {};
+                            switch (item.mediaType) {
+                                case 'image':    payload.image = buf; if (item.mediaCaption) payload.caption = item.mediaCaption; break;
+                                case 'video':    payload.video = buf; if (item.mediaCaption) payload.caption = item.mediaCaption; break;
+                                case 'audio':    payload.audio = buf; payload.mimetype = item.mediaMimetype || 'audio/mpeg'; payload.ptt = false; break;
+                                case 'sticker':  payload.sticker = buf; break;
+                                case 'document': payload.document = buf; payload.mimetype = item.mediaMimetype || 'application/octet-stream'; if (item.mediaCaption) payload.fileName = item.mediaCaption; break;
+                            }
+                            await sock.sendMessage(item.targetJid, payload);
+                        } else if (item.message) {
+                            await sock.sendMessage(item.targetJid, { text: item.message });
+                        }
 
-            for (const item of schedules) {
-                if (now < item.sendAt) {
-                    remaining.push(item);
-                    continue;
+                        console.log(`[SCHEDULE] ✅ Sent ID:${item.id} → ${item.targetJid} (${item.recurrence})`);
+                        changed = true;
+
+                        // Recurrence requeue — only on success
+                        if (item.recurrence === 'daily') {
+                            remaining.push({ ...item, sendAt: item.sendAt + 86_400_000, lastSentAt: now });
+                        } else if (item.recurrence === 'weekly') {
+                            remaining.push({ ...item, sendAt: item.sendAt + 7 * 86_400_000, lastSentAt: now });
+                        }
+
+                    } catch (e: any) {
+                        console.error(`[SCHEDULE] ❌ Failed ID:${item.id}: ${e.message}`);
+                        // Retry in 60s instead of silently dropping (fixes Bug 2)
+                        remaining.push({ ...item, sendAt: now + 60_000 });
+                        changed = true;
+                    }
                 }
+
+                if (changed) await saveSchedules(remaining);
+            } catch (e: any) {
+                console.error('[SCHEDULE] Engine error:', e.message);
+            }
+        }
+    }
+];
 
                 // ── Fire the message ──────────────────────────────────────
                 try {
@@ -263,11 +305,10 @@ export default {
         '  [reply to a photo] .schedule 1h30m',
         '  [reply to a video] .schedule 14:30 daily 120363..@g.us',
     ].join('\n'),
+    schedules,
 
     async handler(sock: any, message: any, args: any[], context: BotContext) {
         const { chatId, senderId, channelInfo } = context;
-
-        startSchedulerEngine(sock);
 
         // ── No args → show help ───────────────────────────────────────────
         if (!args || args.length === 0) {
