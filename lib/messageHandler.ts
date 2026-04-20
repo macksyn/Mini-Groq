@@ -295,7 +295,6 @@ async function handleMessages(sock: any, messageUpdate: any) {
         const userMessage = messageText.toLowerCase();
 
         const senderIsSudo = await isSudo(senderId);
-        startSchedulerEngine(sock);
 
         if (!message.key.fromMe) {
             const replied = await handleAutoReply(sock, chatId, message, userMessage);
