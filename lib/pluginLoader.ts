@@ -39,6 +39,7 @@ const require = createRequire(import.meta.url);
 import path from 'path';
 import fs from 'fs';
 import { fileURLToPath } from 'url';
+import cron from 'node-cron';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname  = path.dirname(__filename);
@@ -48,8 +49,9 @@ const { printLog } = require('./print');
 // ── Types ────────────────────────────────────────────────────────────────────
 
 interface Schedule {
-  at?:      string;
+  at?:      string | (() => string);
   every?:   number;
+  cron?:    string;
   handler:  (sock: any) => Promise<void>;
 }
 
@@ -71,23 +73,21 @@ interface MessageHook {
 let _sock:    any    = null;
 let _started: boolean = false;
 
-const _messageHooks: MessageHook[] = [];
+const _messageHooks: MessageHook[]    = [];
 const _timers:       NodeJS.Timeout[] = [];
+const _cronJobs:     cron.ScheduledTask[] = [];
 
 const settings = (() => {
-  try { return require('../settings'); }
-  catch { return { timeZone: 'UTC' }; }
+  try { return require('../config').default || require('../config'); }
+  catch { return { timeZone: 'Africa/Lagos' }; }
 })();
+
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-function nowInTZ(): string {
-  return new Date().toLocaleString('en-GB', {
-    timeZone: settings.timeZone || 'UTC',
-    hour:     '2-digit',
-    minute:   '2-digit',
-    hour12:   false,
-  });
+function timeToCron(timeStr: string): string {
+  const [h, m] = timeStr.split(':').map(Number);
+  return `${m} ${h} * * *`;
 }
 
 function pluginsDir(): string {
@@ -113,30 +113,40 @@ function loadAllPlugins(): Plugin[] {
 
 // ── Schedule engine ───────────────────────────────────────────────────────────
 
-function scheduleAtTime(timeStr: string, handler: (sock: any) => Promise<void>, label: string): void {
-  let lastFiredDate: string | null = null;
+function scheduleAtTime(timeStrOrFn: string | (() => string), handler: (sock: any) => Promise<void>, label: string): void {
+  const timeStr    = typeof timeStrOrFn === 'function' ? timeStrOrFn() : timeStrOrFn;
+  const expression = timeToCron(timeStr);
+  const timezone   = settings.timeZone || 'UTC';
 
-  const id = setInterval(async () => {
-    const now   = nowInTZ();
-    const today = new Date().toLocaleDateString();
-
-    if (now === timeStr && lastFiredDate !== today) {
-      lastFiredDate = today;
-      printLog('info', `[pluginLoader] ⏰ Schedule "${label}" firing at ${timeStr}`);
-      try {
-        await handler(_sock);
-      } catch (err: any) {
-        printLog('error', `[pluginLoader] Schedule "${label}" error: ${err.message}`);
-      }
+  const job = cron.schedule(expression, async () => {
+    printLog('info', `[pluginLoader] ⏰ Schedule "${label}" firing at ${timeStr}`);
+    try {
+      await handler(_sock);
+    } catch (err: any) {
+      printLog('error', `[pluginLoader] Schedule "${label}" error: ${err.message}`);
     }
-  }, 60_000);
+  }, { timezone });
 
-  _timers.push(id);
+  _cronJobs.push(job);
+}
+
+function scheduleCron(expr: string, handler: (sock: any) => Promise<void>, label: string): void {
+  const timezone = settings.timeZone || 'UTC';
+
+  const job = cron.schedule(expr, async () => {
+    printLog('info', `[pluginLoader] 🔁 Cron "${label}" firing`);
+    try {
+      await handler(_sock);
+    } catch (err: any) {
+      printLog('error', `[pluginLoader] Cron "${label}" error: ${err.message}`);
+    }
+  }, { timezone });
+
+  _cronJobs.push(job);
 }
 
 function scheduleEvery(ms: number, handler: (sock: any) => Promise<void>, label: string): void {
   const id = setInterval(async () => {
-    printLog('info', `[pluginLoader] 🔁 Interval "${label}" firing`);
     try {
       await handler(_sock);
     } catch (err: any) {
@@ -154,10 +164,11 @@ const pluginLoader = {
    * Call once inside `connection.update → connection === 'open'`.
    * Safe to call multiple times — only runs once.
    */
-  async start(sock: any): Promise<void> {
+// AFTER (always refreshes the socket)
+ async start(sock: any): Promise<void> {
+    _sock = sock;           // ← always update, even after reconnects
     if (_started) return;
     _started = true;
-    _sock    = sock;
 
     printLog('info', '[pluginLoader] Starting plugin lifecycle hooks...');
 
@@ -167,7 +178,7 @@ const pluginLoader = {
     let messageHookCount = 0;
 
     for (const plugin of plugins) {
-      const label = plugin.command || plugin.name || '(unnamed)';
+      const label = plugin.command || plugin.name || (plugin as any).default?.command || (plugin as any).default?.name || '(unnamed)';
 
       // 1. Register onMessage hooks
       if (typeof plugin.onMessage === 'function') {
@@ -189,12 +200,17 @@ const pluginLoader = {
       // 3. Register schedules
       if (Array.isArray(plugin.schedules)) {
         for (const sched of plugin.schedules) {
-          const schedLabel = `${label}/${sched.at ?? sched.every + 'ms'}`;
+          const atValue   = typeof sched.at === 'function' ? sched.at() : sched.at;
+          const schedLabel = `${label}/${atValue ?? sched.cron ?? sched.every + 'ms'}`;
 
           if (sched.at && typeof sched.handler === 'function') {
             scheduleAtTime(sched.at, sched.handler, schedLabel);
             scheduleCount++;
             printLog('info', `[pluginLoader] Schedule registered: ${schedLabel}`);
+          } else if (sched.cron && typeof sched.handler === 'function') {
+            scheduleCron(sched.cron, sched.handler, schedLabel);
+            scheduleCount++;
+            printLog('info', `[pluginLoader] Cron registered: ${schedLabel}`);
           } else if (sched.every && typeof sched.handler === 'function') {
             scheduleEvery(sched.every, sched.handler, schedLabel);
             scheduleCount++;
@@ -223,10 +239,12 @@ const pluginLoader = {
     }
   },
 
-  /** Graceful shutdown — clears all timers */
+  /** Graceful shutdown — clears all timers and cron jobs */
   stop(): void {
     for (const id of _timers) clearInterval(id);
     _timers.length = 0;
+    for (const job of _cronJobs) job.stop();
+    _cronJobs.length = 0;
     _started = false;
     printLog('info', '[pluginLoader] All plugin timers cleared.');
   },
