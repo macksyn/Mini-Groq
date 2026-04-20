@@ -263,19 +263,29 @@ export const schedules = [
                     }
 
                     console.log(`[SCHEDULE] ✅ Sent ID:${item.id} → ${item.targetJid} (${item.recurrence})`);
-                } catch (e: any) {
-                    console.error(`[SCHEDULE] ❌ Failed ID:${item.id}: ${e.message}`);
-                }
+                try {
+    if (item.mediaType && item.mediaBase64) {
+        await _sock.sendMessage(item.targetJid, payload);
+    } else if (item.message) {
+        await _sock.sendMessage(item.targetJid, { text: item.message });
+    }
 
-                // ── Recurrence: requeue or drop ───────────────────────────
-                changed = true;
-                if (item.recurrence === 'daily') {
-                    remaining.push({ ...item, sendAt: item.sendAt + 86_400_000, lastSentAt: now });
-                } else if (item.recurrence === 'weekly') {
-                    remaining.push({ ...item, sendAt: item.sendAt + 7 * 86_400_000, lastSentAt: now });
-                }
-                // 'once' → simply not pushed back
-            }
+    console.log(`[SCHEDULE] ✅ Sent ID:${item.id}`);
+    changed = true;
+
+    // Recurrence requeue — only on success
+    if (item.recurrence === 'daily') {
+        remaining.push({ ...item, sendAt: item.sendAt + 86_400_000, lastSentAt: now });
+    } else if (item.recurrence === 'weekly') {
+        remaining.push({ ...item, sendAt: item.sendAt + 7 * 86_400_000, lastSentAt: now });
+    }
+
+} catch (e: any) {
+    console.error(`[SCHEDULE] ❌ Failed ID:${item.id}: ${e.message}`);
+    // Re-queue for retry in 60 seconds instead of silently dropping
+    remaining.push({ ...item, sendAt: now + 60_000 });
+    changed = true;
+}
 
             if (changed) await saveSchedules(remaining);
         } catch (e: any) {
