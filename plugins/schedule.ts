@@ -12,39 +12,33 @@ const HAS_DB = !!(
 
 const configPath = dataFile('schedules.json');
 
-// ── Max media size to store (5 MB)
 const MAX_MEDIA_BYTES = 5 * 1024 * 1024;
 
 export type Recurrence = 'once' | 'daily' | 'weekly';
 
 export interface ScheduledMessage {
     id: string;
-    /** Chat where the command was issued */
     chatId: string;
-    /** Chat / JID where the message will actually be sent */
     targetJid: string;
     senderId: string;
-    /** Plain text to send (mutually exclusive with media fields) */
     message?: string;
-    /** 'image' | 'video' | 'audio' | 'sticker' | 'document' */
     mediaType?: string;
-    /** Base64-encoded media buffer */
     mediaBase64?: string;
     mediaMimetype?: string;
     mediaCaption?: string;
-    /** Epoch ms — when to fire next */
     sendAt: number;
     createdAt: number;
     recurrence: Recurrence;
     lastSentAt?: number;
 }
 
-// ── Storage helpers ────────────────────────────────────────────────────────────
+// ── Storage ───────────────────────────────────────────────────────────────────
 
 export async function loadSchedules(): Promise<ScheduledMessage[]> {
     try {
         if (HAS_DB) {
-            return (await store.getSetting('global', 'schedules')) ?? [];
+            const result = await store.getSetting('global', 'schedules');
+            return result?.items ?? [];
         }
         if (!fs.existsSync(configPath)) {
             fs.mkdirSync(path.dirname(configPath), { recursive: true });
@@ -58,26 +52,21 @@ export async function loadSchedules(): Promise<ScheduledMessage[]> {
 
 export async function saveSchedules(data: ScheduledMessage[]): Promise<void> {
     if (HAS_DB) {
-        await store.saveSetting('global', 'schedules', data);
+        await store.saveSetting('global', 'schedules', { items: data });
     } else {
         fs.writeFileSync(configPath, JSON.stringify(data, null, 2));
     }
 }
 
-// ── Utilities ──────────────────────────────────────────────────────────────────
+// ── Utilities ─────────────────────────────────────────────────────────────────
 
 export function generateId(): string {
     return Math.random().toString(36).substring(2, 7).toUpperCase();
 }
 
-/**
- * Parse a time string into a future Date.
- * Supports: 10m | 2h | 1h30m | 14:30 | 10:30am
- */
 export function parseTime(input: string): Date | null {
     const now = new Date();
 
-    // relative: 10m | 2h | 1h30m
     const rel = input.match(/^(?:(\d+)h)?(?:(\d+)m)?$/i);
     if (rel && (rel[1] || rel[2])) {
         const h = parseInt(rel[1] ?? '0', 10);
@@ -86,7 +75,6 @@ export function parseTime(input: string): Date | null {
         return new Date(now.getTime() + (h * 60 + m) * 60_000);
     }
 
-    // clock: 14:30 | 10:30am | 9:00pm
     const clock = input.match(/^(\d{1,2}):(\d{2})(am|pm)?$/i);
     if (clock) {
         let hour = parseInt(clock[1], 10);
@@ -116,26 +104,12 @@ export function formatTimeLeft(ms: number): string {
     return parts.join(' ');
 }
 
-/**
- * Detect whether a string token looks like a JID or bare phone number.
- * Returns the normalised JID, or null if it is not a JID.
- */
 function toJid(token: string): string | null {
-    // Already a full JID
     if (/@(s\.whatsapp\.net|g\.us|lid)$/.test(token)) return token;
-    // Bare digits (≥ 10) → private chat
     if (/^\d{10,}$/.test(token)) return `${token}@s.whatsapp.net`;
     return null;
 }
 
-/**
- * Parse the argument list after `.schedule`.
- *
- * Syntax:  <time>  [once|daily|weekly]  [<jid|number>]  [message...]
- *
- * Any token that looks like a JID / phone number is treated as the target.
- * All remaining tokens become the message text.
- */
 function parseArgs(args: string[]): {
     time: string;
     recurrence: Recurrence;
@@ -164,62 +138,79 @@ function parseArgs(args: string[]): {
     return { time, recurrence, targetJid, messageText: args.slice(i).join(' ').trim() };
 }
 
-// Remove these entirely:
-// let _engineStarted = false;
-// export function startSchedulerEngine(sock: any): void { ... }
+// ── Scheduler engine (runs via pluginLoader) ──────────────────────────────────
 
-// Add this named export instead:
+async function runEngine(sock: any): Promise<void> {
+    const now = Date.now();
+    const items = await loadSchedules();
+    const remaining: ScheduledMessage[] = [];
+    let changed = false;
+
+    for (const item of items) {
+        if (now < item.sendAt) {
+            remaining.push(item);
+            continue;
+        }
+
+        try {
+            if (item.mediaType && item.mediaBase64) {
+                const buf = Buffer.from(item.mediaBase64, 'base64');
+                const payload: Record<string, any> = {};
+
+                switch (item.mediaType) {
+                    case 'image':
+                        payload.image = buf;
+                        if (item.mediaCaption) payload.caption = item.mediaCaption;
+                        break;
+                    case 'video':
+                        payload.video = buf;
+                        if (item.mediaCaption) payload.caption = item.mediaCaption;
+                        break;
+                    case 'audio':
+                        payload.audio = buf;
+                        payload.mimetype = item.mediaMimetype || 'audio/mpeg';
+                        payload.ptt = false;
+                        break;
+                    case 'sticker':
+                        payload.sticker = buf;
+                        break;
+                    case 'document':
+                        payload.document = buf;
+                        payload.mimetype = item.mediaMimetype || 'application/octet-stream';
+                        if (item.mediaCaption) payload.fileName = item.mediaCaption;
+                        break;
+                }
+
+                await sock.sendMessage(item.targetJid, payload);
+            } else if (item.message) {
+                await sock.sendMessage(item.targetJid, { text: item.message });
+            }
+
+            console.log(`[SCHEDULE] ✅ Sent ID:${item.id} → ${item.targetJid} (${item.recurrence})`);
+            changed = true;
+
+            if (item.recurrence === 'daily') {
+                remaining.push({ ...item, sendAt: item.sendAt + 86_400_000, lastSentAt: now });
+            } else if (item.recurrence === 'weekly') {
+                remaining.push({ ...item, sendAt: item.sendAt + 7 * 86_400_000, lastSentAt: now });
+            }
+
+        } catch (e: any) {
+            console.error(`[SCHEDULE] ❌ Failed ID:${item.id}: ${e.message}`);
+            remaining.push({ ...item, sendAt: now + 60_000 });
+            changed = true;
+        }
+    }
+
+    if (changed) await saveSchedules(remaining);
+}
+
 export const schedules = [
     {
         every: 10_000,
         handler: async (sock: any) => {
             try {
-                const now = Date.now();
-                const schedules = await loadSchedules();
-                const remaining: ScheduledMessage[] = [];
-                let changed = false;
-
-                for (const item of schedules) {
-                    if (now < item.sendAt) {
-                        remaining.push(item);
-                        continue;
-                    }
-
-                    try {
-                        if (item.mediaType && item.mediaBase64) {
-                            const buf = Buffer.from(item.mediaBase64, 'base64');
-                            const payload: Record<string, any> = {};
-                            switch (item.mediaType) {
-                                case 'image':    payload.image = buf; if (item.mediaCaption) payload.caption = item.mediaCaption; break;
-                                case 'video':    payload.video = buf; if (item.mediaCaption) payload.caption = item.mediaCaption; break;
-                                case 'audio':    payload.audio = buf; payload.mimetype = item.mediaMimetype || 'audio/mpeg'; payload.ptt = false; break;
-                                case 'sticker':  payload.sticker = buf; break;
-                                case 'document': payload.document = buf; payload.mimetype = item.mediaMimetype || 'application/octet-stream'; if (item.mediaCaption) payload.fileName = item.mediaCaption; break;
-                            }
-                            await sock.sendMessage(item.targetJid, payload);
-                        } else if (item.message) {
-                            await sock.sendMessage(item.targetJid, { text: item.message });
-                        }
-
-                        console.log(`[SCHEDULE] ✅ Sent ID:${item.id} → ${item.targetJid} (${item.recurrence})`);
-                        changed = true;
-
-                        // Recurrence requeue — only on success
-                        if (item.recurrence === 'daily') {
-                            remaining.push({ ...item, sendAt: item.sendAt + 86_400_000, lastSentAt: now });
-                        } else if (item.recurrence === 'weekly') {
-                            remaining.push({ ...item, sendAt: item.sendAt + 7 * 86_400_000, lastSentAt: now });
-                        }
-
-                    } catch (e: any) {
-                        console.error(`[SCHEDULE] ❌ Failed ID:${item.id}: ${e.message}`);
-                        // Retry in 60s instead of silently dropping (fixes Bug 2)
-                        remaining.push({ ...item, sendAt: now + 60_000 });
-                        changed = true;
-                    }
-                }
-
-                if (changed) await saveSchedules(remaining);
+                await runEngine(sock);
             } catch (e: any) {
                 console.error('[SCHEDULE] Engine error:', e.message);
             }
@@ -227,99 +218,19 @@ export const schedules = [
     }
 ];
 
-                // ── Fire the message ──────────────────────────────────────
-                try {
-                    if (item.mediaType && item.mediaBase64) {
-                        const buf = Buffer.from(item.mediaBase64, 'base64');
-                        const payload: Record<string, any> = {};
-
-                        switch (item.mediaType) {
-                            case 'image':
-                                payload.image = buf;
-                                if (item.mediaCaption) payload.caption = item.mediaCaption;
-                                break;
-                            case 'video':
-                                payload.video = buf;
-                                if (item.mediaCaption) payload.caption = item.mediaCaption;
-                                break;
-                            case 'audio':
-                                payload.audio = buf;
-                                payload.mimetype = item.mediaMimetype || 'audio/mpeg';
-                                payload.ptt = false;
-                                break;
-                            case 'sticker':
-                                payload.sticker = buf;
-                                break;
-                            case 'document':
-                                payload.document = buf;
-                                payload.mimetype = item.mediaMimetype || 'application/octet-stream';
-                                if (item.mediaCaption) payload.fileName = item.mediaCaption;
-                                break;
-                        }
-
-                        await sock.sendMessage(item.targetJid, payload);
-                    } else if (item.message) {
-                        await sock.sendMessage(item.targetJid, { text: item.message });
-                    }
-
-                    console.log(`[SCHEDULE] ✅ Sent ID:${item.id} → ${item.targetJid} (${item.recurrence})`);
-                try {
-    if (item.mediaType && item.mediaBase64) {
-        await _sock.sendMessage(item.targetJid, payload);
-    } else if (item.message) {
-        await _sock.sendMessage(item.targetJid, { text: item.message });
-    }
-
-    console.log(`[SCHEDULE] ✅ Sent ID:${item.id}`);
-    changed = true;
-
-    // Recurrence requeue — only on success
-    if (item.recurrence === 'daily') {
-        remaining.push({ ...item, sendAt: item.sendAt + 86_400_000, lastSentAt: now });
-    } else if (item.recurrence === 'weekly') {
-        remaining.push({ ...item, sendAt: item.sendAt + 7 * 86_400_000, lastSentAt: now });
-    }
-
-} catch (e: any) {
-    console.error(`[SCHEDULE] ❌ Failed ID:${item.id}: ${e.message}`);
-    // Re-queue for retry in 60 seconds instead of silently dropping
-    remaining.push({ ...item, sendAt: now + 60_000 });
-    changed = true;
-}
-
-            if (changed) await saveSchedules(remaining);
-        } catch (e: any) {
-            console.error('[SCHEDULE] Engine error:', e.message);
-        }
-    }, 10_000);
-
-// ── Command handler ────────────────────────────────────────────────────────────
+// ── Command handler ───────────────────────────────────────────────────────────
 
 export default {
     command: 'schedule',
     aliases: ['sched', 'remind', 'remindme'],
     category: 'utility',
     description: 'Schedule any message — text, media, or quoted — to any chat',
-    usage: [
-        '.schedule <time> [once|daily|weekly] [jid] [text]',
-        '',
-        'Time formats:  10m  2h  1h30m  14:30  10:30am',
-        'Recurrence:    once (default) | daily | weekly',
-        'JID:           phone number (e.g. 2348012345678) or full JID',
-        '',
-        'Examples:',
-        '  .schedule 10m Good morning!',
-        '  .schedule 9:00am daily Good morning everyone!',
-        '  .schedule 2h weekly 2348012345678 Weekly reminder',
-        '  [reply to a photo] .schedule 1h30m',
-        '  [reply to a video] .schedule 14:30 daily 120363..@g.us',
-    ].join('\n'),
+    usage: '.schedule <time> [once|daily|weekly] [jid] [text]',
     schedules,
 
     async handler(sock: any, message: any, args: any[], context: BotContext) {
         const { chatId, senderId, channelInfo } = context;
 
-        // ── No args → show help ───────────────────────────────────────────
         if (!args || args.length === 0) {
             return await sock.sendMessage(chatId, {
                 text:
@@ -352,7 +263,6 @@ export default {
             }, { quoted: message });
         }
 
-        // ── Parse args ────────────────────────────────────────────────────
         const { time, recurrence, targetJid, messageText } = parseArgs(args);
 
         if (!time) {
@@ -372,7 +282,6 @@ export default {
 
         const destination = targetJid ?? chatId;
 
-        // ── Check for quoted message ──────────────────────────────────────
         const quotedCtx = message.message?.extendedTextMessage?.contextInfo;
         const quotedMsg = quotedCtx?.quotedMessage;
 
@@ -389,13 +298,10 @@ export default {
         if (quotedMsg) {
             const qType = Object.keys(quotedMsg)[0];
 
-            // ── Quoted text ───────────────────────────────────────────────
             if (qType === 'conversation' || qType === 'extendedTextMessage') {
                 const qText = quotedMsg.conversation ?? quotedMsg.extendedTextMessage?.text ?? '';
-                // Prefer explicitly typed text; fall back to quoted text
                 newItem.message = messageText || qText;
 
-            // ── Quoted media ──────────────────────────────────────────────
             } else if (['imageMessage', 'videoMessage', 'audioMessage',
                         'stickerMessage', 'documentMessage'].includes(qType)) {
                 const mediaKind = qType.replace('Message', '') as any;
@@ -417,10 +323,9 @@ export default {
                         }, { quoted: message });
                     }
 
-                    newItem.mediaType = mediaKind;
-                    newItem.mediaBase64 = buf.toString('base64');
+                    newItem.mediaType    = mediaKind;
+                    newItem.mediaBase64  = buf.toString('base64');
                     newItem.mediaMimetype = quotedMsg[qType]?.mimetype ?? '';
-                    // Use typed text as caption override, then fall back to original caption
                     newItem.mediaCaption = messageText || quotedMsg[qType]?.caption || '';
                 } catch (e: any) {
                     return await sock.sendMessage(chatId, {
@@ -435,7 +340,6 @@ export default {
                 }, { quoted: message });
             }
 
-        // ── Plain text (no quote) ─────────────────────────────────────────
         } else if (messageText) {
             newItem.message = messageText;
         } else {
@@ -445,22 +349,19 @@ export default {
             }, { quoted: message });
         }
 
-        // ── Save and confirm ──────────────────────────────────────────────
-        const schedules = await loadSchedules();
-        schedules.push(newItem);
-        await saveSchedules(schedules);
+        const existing = await loadSchedules();
+        existing.push(newItem);
+        await saveSchedules(existing);
 
-        const timeLeft = formatTimeLeft(targetDate.getTime() - Date.now());
-        const timeStr  = targetDate.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-        const typeLabel = newItem.mediaType
+        const timeLeft   = formatTimeLeft(targetDate.getTime() - Date.now());
+        const timeStr    = targetDate.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+        const typeLabel  = newItem.mediaType
             ? `📎 ${newItem.mediaType.charAt(0).toUpperCase() + newItem.mediaType.slice(1)}`
             : `💬 Text`;
-        const destLabel = destination === chatId ? 'this chat' : destination.split('@')[0];
+        const destLabel  = destination === chatId ? 'this chat' : destination.split('@')[0];
         const recurLabel = recurrence === 'once'
             ? 'once'
-            : recurrence === 'daily'
-                ? 'every day at this time'
-                : 'every week at this time';
+            : recurrence === 'daily' ? 'every day at this time' : 'every week at this time';
 
         await sock.sendMessage(chatId, {
             text:
