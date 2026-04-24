@@ -409,12 +409,14 @@ if (MONGO_URL) {
 if (backend === 'memory' && POSTGRES_URL) {
   try {
     const { Pool } = require('pg')
+    const PG_POOL_MAX = Number(process.env.PG_POOL_MAX) || 5
+    const PG_POOL_MIN = Number(process.env.PG_POOL_MIN) || 0
     const pool = new Pool({
       connectionString: POSTGRES_URL,
       ssl: { rejectUnauthorized: false },
-      max: 20,
-      min: 2,
-      idleTimeoutMillis: 60000,
+      max: PG_POOL_MAX,
+      min: PG_POOL_MIN,
+      idleTimeoutMillis: 10000,
       connectionTimeoutMillis: 10000,
       keepAlive: true,
       keepAliveInitialDelayMillis: 10000
