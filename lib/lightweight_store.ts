@@ -1896,7 +1896,37 @@ const store = {
     }
   },
 
+  // ---- Settings cache (in-memory, TTL-based) ----
+  // Dramatically cuts DB round-trips: every incoming message reads many settings,
+  // but settings change infrequently. Cache hits avoid network/DB I/O entirely.
+  _settingCache: new Map(),       // key: `${chatId}::${key}` -> { value, expires }
+  _allSettingsCache: new Map(),   // key: chatId             -> { value, expires }
+  _settingsCacheTtlMs: Number(process.env.SETTINGS_CACHE_TTL_MS) || 30_000,
+  _settingsInflight: new Map(),   // dedupe concurrent reads of the same key
+
+  _settingCacheGet(chatId, key) {
+    const cacheKey = `${chatId}::${key}`
+    const entry = this._settingCache.get(cacheKey)
+    if (entry && entry.expires > Date.now()) return entry
+    if (entry) this._settingCache.delete(cacheKey)
+    return null
+  },
+
+  _settingCacheSet(chatId, key, value) {
+    const cacheKey = `${chatId}::${key}`
+    this._settingCache.set(cacheKey, { value, expires: Date.now() + this._settingsCacheTtlMs })
+  },
+
+  _settingCacheInvalidate(chatId, key) {
+    this._settingCache.delete(`${chatId}::${key}`)
+    this._allSettingsCache.delete(chatId)
+  },
+
   async saveSetting(chatId, key, value) {
+    // Update cache immediately so subsequent reads return the new value.
+    this._settingCacheSet(chatId, key, value)
+    this._allSettingsCache.delete(chatId)
+
     if (backend === 'memory') {
       const dataDir = './data'
       if (!fs.existsSync(dataDir)) fs.mkdirSync(dataDir, { recursive: true })
@@ -1907,83 +1937,100 @@ const store = {
         fs.writeFileSync(filePath, JSON.stringify(value, null, 2))
       } catch (e) {
         console.error(`[STORE] Failed to save setting ${key}:`, e.message)
+        this._settingCacheInvalidate(chatId, key)
       }
     } else {
       try {
         await adapters[backend].saveSetting(chatId, key, value)
       } catch (e) {
         console.error(`[STORE] Failed to save setting ${key}:`, e.message)
+        this._settingCacheInvalidate(chatId, key)
       }
     }
   },
 
   async getSetting(chatId, key) {
-    if (backend === 'memory') {
-      const dataDir = './data'
-      const filePath = path.join(dataDir, `${key}.json`)
+    const cached = this._settingCacheGet(chatId, key)
+    if (cached) return cached.value
 
-      try {
-        if (fs.existsSync(filePath)) {
-          const data = JSON.parse(fs.readFileSync(filePath, 'utf-8'))
-          // Flat format {enabled: ...} takes priority over {chatId: {enabled: ...}}
-          if (data.enabled !== undefined) return data;
-          if (data[chatId] !== undefined) return data[chatId];
-          return null
+    // Dedupe concurrent reads of the same setting so a burst of plugin hooks
+    // only triggers one DB round-trip instead of N.
+    const inflightKey = `${chatId}::${key}`
+    const existing = this._settingsInflight.get(inflightKey)
+    if (existing) return existing
+
+    const promise = (async () => {
+      let value: any = null
+      if (backend === 'memory') {
+        const dataDir = './data'
+        const filePath = path.join(dataDir, `${key}.json`)
+        try {
+          if (fs.existsSync(filePath)) {
+            const data = JSON.parse(fs.readFileSync(filePath, 'utf-8'))
+            if (data.enabled !== undefined) value = data
+            else if (data[chatId] !== undefined) value = data[chatId]
+          }
+        } catch (e) {
+          console.error(`[STORE] Failed to get setting ${key}:`, e.message)
         }
-        return null
-      } catch (e) {
-        console.error(`[STORE] Failed to get setting ${key}:`, e.message)
-        return null
+      } else {
+        try {
+          value = await adapters[backend].getSetting(chatId, key)
+        } catch (e) {
+          console.error(`[STORE] Failed to get setting ${key}:`, e.message)
+        }
       }
-    } else {
-      try {
-        return await adapters[backend].getSetting(chatId, key)
-      } catch (e) {
-        console.error(`[STORE] Failed to get setting ${key}:`, e.message)
-        return null
-      }
+      this._settingCacheSet(chatId, key, value)
+      return value
+    })()
+
+    this._settingsInflight.set(inflightKey, promise)
+    try {
+      return await promise
+    } finally {
+      this._settingsInflight.delete(inflightKey)
     }
   },
 
   async getAllSettings(chatId) {
+    const cached = this._allSettingsCache.get(chatId)
+    if (cached && cached.expires > Date.now()) return cached.value
+    if (cached) this._allSettingsCache.delete(chatId)
+
+    let result: any = {}
     if (backend === 'memory') {
       const dataDir = './data'
-      const result = {}
-
       try {
         if (fs.existsSync(dataDir)) {
           const files = fs.readdirSync(dataDir).filter(f => f.endsWith('.json'))
-
           for (const file of files) {
             const key = path.basename(file, '.json')
             if (key === 'messageCount' || key === 'owner') continue
-
             const filePath = path.join(dataDir, file)
             const data = JSON.parse(fs.readFileSync(filePath, 'utf-8'))
-
-            if (data[chatId]) {
-              result[key] = data[chatId]
-            }
+            if (data[chatId]) result[key] = data[chatId]
           }
         }
-        return result
       } catch (e) {
         console.error(`[STORE] Failed to get all settings:`, e.message)
-        return {}
       }
     } else {
       try {
-        return await adapters[backend].getAllSettings(chatId)
+        result = await adapters[backend].getAllSettings(chatId)
       } catch (e) {
         console.error(`[STORE] Failed to get all settings:`, e.message)
-        return {}
+        result = {}
       }
     }
+    this._allSettingsCache.set(chatId, { value: result, expires: Date.now() + this._settingsCacheTtlMs })
+    return result
   },
 
   /**
   * BOT MODE METHODS (Advanced)
   */
+
+  _botModeCache: null as null | { value: string, expires: number },
 
   async setBotMode(mode) {
     const validModes = ['public', 'private', 'groups', 'inbox', 'self']
@@ -1992,6 +2039,8 @@ const store = {
       mode = 'public'
     }
 
+    this._botModeCache = { value: mode, expires: Date.now() + this._settingsCacheTtlMs }
+
     if (backend === 'memory') {
       this.botMode = mode
     } else {
@@ -1999,22 +2048,27 @@ const store = {
         await adapters[backend].setMetadata('botMode', mode)
       } catch (e) {
         console.error(`[STORE] Failed to set bot mode:`, e.message)
+        this._botModeCache = null
       }
     }
   },
 
   async getBotMode() {
+    if (this._botModeCache && this._botModeCache.expires > Date.now()) {
+      return this._botModeCache.value
+    }
+    let mode = 'public'
     if (backend === 'memory') {
-      return this.botMode || 'public'
+      mode = this.botMode || 'public'
     } else {
       try {
-        const mode = await adapters[backend].getMetadata('botMode')
-        return mode || 'public'
+        mode = (await adapters[backend].getMetadata('botMode')) || 'public'
       } catch (e) {
         console.error(`[STORE] Failed to get bot mode:`, e.message)
-        return 'public'
       }
     }
+    this._botModeCache = { value: mode, expires: Date.now() + this._settingsCacheTtlMs }
+    return mode
   },
 
   async incrementMessageCount(chatId: any, userId: any, _pushName?: string) {
