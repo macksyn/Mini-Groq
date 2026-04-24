@@ -483,6 +483,22 @@ if (backend === 'memory' && POSTGRES_URL) {
                 )
               `)
 
+              // Migrate legacy `settings` table if its schema is incompatible
+              const existing = await client.query(
+                `SELECT column_name FROM information_schema.columns
+                 WHERE table_schema = current_schema() AND table_name = 'settings'`
+              )
+              if (existing.rows.length > 0) {
+                const cols = existing.rows.map(r => r.column_name)
+                const required = ['chat_id', 'key', 'value', 'ts']
+                const compatible = required.every(c => cols.includes(c))
+                if (!compatible) {
+                  const legacyName = `settings_legacy_${Date.now()}`
+                  printLog('warning', `Legacy 'settings' table detected (columns: ${cols.join(',')}). Renaming to ${legacyName} to preserve data.`)
+                  await client.query(`ALTER TABLE settings RENAME TO ${legacyName}`)
+                }
+              }
+
               await client.query(`
                 CREATE TABLE IF NOT EXISTS settings (
                   chat_id TEXT NOT NULL,
