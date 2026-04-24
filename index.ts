@@ -449,15 +449,9 @@ async function startQasimDev(): Promise<any> {
                 printLog('success', 'Bot connected successfully!');
 
                 try {
-                    await commandHandler.runOnLoad(QasimDev);
-                } catch (e: any) {
-                    printLog('error', `Failed to run plugin onLoad hooks: ${e.message}`);
-                }
-                
-                try {
                     await pluginLoader.start(QasimDev);
                 } catch (e: any) {
-                    printLog('error', `Failed to start plugin schedules: ${e.message}`);
+                    printLog('error', `Failed to start plugin lifecycle hooks: ${e.message}`);
                 }
 
                 try {
