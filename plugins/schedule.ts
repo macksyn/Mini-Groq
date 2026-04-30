@@ -4,6 +4,11 @@ import path from 'path';
 import { dataFile } from '../lib/paths.js';
 import store from '../lib/lightweight_store.js';
 import { downloadContentFromMessage } from '@whiskeysockets/baileys';
+import moment from 'moment-timezone';
+import config from '../config.js';
+
+// ── Timezone — pulled from env or config, falls back to Africa/Lagos ──────────
+const TZ: string = process.env.TIMEZONE || (config as any).timeZone || 'Africa/Lagos';
 
 const HAS_DB = !!(
     process.env.MONGO_URL || process.env.POSTGRES_URL ||
@@ -64,17 +69,25 @@ export function generateId(): string {
     return Math.random().toString(36).substring(2, 7).toUpperCase();
 }
 
+/**
+ * Parse a time string into a Date, always interpreting clock times
+ * (e.g. "7:46am") relative to the bot's configured timezone (TZ).
+ * Relative offsets like "10m" or "2h" are timezone-agnostic.
+ */
 export function parseTime(input: string): Date | null {
-    const now = new Date();
+    const now = Date.now();
 
+    // ── Relative offset: 10m / 2h / 1h30m ────────────────────────────────────
     const rel = input.match(/^(?:(\d+)h)?(?:(\d+)m)?$/i);
     if (rel && (rel[1] || rel[2])) {
         const h = parseInt(rel[1] ?? '0', 10);
         const m = parseInt(rel[2] ?? '0', 10);
         if (h === 0 && m === 0) return null;
-        return new Date(now.getTime() + (h * 60 + m) * 60_000);
+        return new Date(now + (h * 60 + m) * 60_000);
     }
 
+    // ── Clock time: 14:30 / 7:46am / 10:30pm ─────────────────────────────────
+    // Interpreted in the bot's configured timezone, NOT the server's local time.
     const clock = input.match(/^(\d{1,2}):(\d{2})(am|pm)?$/i);
     if (clock) {
         let hour = parseInt(clock[1], 10);
@@ -82,10 +95,14 @@ export function parseTime(input: string): Date | null {
         const mer = clock[3]?.toLowerCase();
         if (mer === 'pm' && hour < 12) hour += 12;
         if (mer === 'am' && hour === 12) hour = 0;
-        const target = new Date(now);
-        target.setHours(hour, min, 0, 0);
-        if (target.getTime() <= now.getTime()) target.setDate(target.getDate() + 1);
-        return target;
+
+        // Build the target moment in the configured timezone
+        const target = moment.tz(TZ).set({ hour, minute: min, second: 0, millisecond: 0 });
+
+        // If the time has already passed today, roll to tomorrow
+        if (target.valueOf() <= now) target.add(1, 'day');
+
+        return target.toDate();
     }
 
     return null;
@@ -353,8 +370,9 @@ export default {
         existing.push(newItem);
         await saveSchedules(existing);
 
-        const timeLeft   = formatTimeLeft(targetDate.getTime() - Date.now());
-        const timeStr    = targetDate.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+        const timeLeft = formatTimeLeft(targetDate.getTime() - Date.now());
+        // Format the fire time in the bot's configured timezone — not the server's local time
+        const timeStr    = moment(targetDate).tz(TZ).format('hh:mm A');
         const typeLabel  = newItem.mediaType
             ? `📎 ${newItem.mediaType.charAt(0).toUpperCase() + newItem.mediaType.slice(1)}`
             : `💬 Text`;
@@ -368,7 +386,7 @@ export default {
                 `✅ *Message Scheduled!*\n\n` +
                 `📌 *ID:* ${newItem.id}\n` +
                 `${typeLabel}\n` +
-                `⏳ *Fires in:* ${timeLeft} (at ${timeStr})\n` +
+                `⏳ *Fires in:* ${timeLeft} (at ${timeStr} ${TZ})\n` +
                 `🔁 *Recurrence:* ${recurLabel}\n` +
                 `📬 *Destination:* ${destLabel}\n\n` +
                 `_Use \`.schedulecancel ${newItem.id}\` to cancel_\n` +
