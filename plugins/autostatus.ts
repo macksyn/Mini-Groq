@@ -52,18 +52,19 @@ function cleanNumber(raw: string): string {
 
 async function readConfig() {
     try {
+        let raw: any = null;
         if (HAS_DB) {
-            const config = await store.getSetting('global', 'autoStatus');
-            return config || { enabled: false, reactOn: false, filterMode: 'none', filterList: [] };
+            raw = await store.getSetting('global', 'autoStatus');
         } else {
-            const config = JSON.parse(fs.readFileSync(configPath, 'utf8'));
-            return {
-                enabled:    !!config.enabled,
-                reactOn:    !!config.reactOn,
-                filterMode: config.filterMode  || 'none',
-                filterList: config.filterList  || []
-            };
+            raw = JSON.parse(fs.readFileSync(configPath, 'utf8'));
         }
+        // Always normalise — handles old configs that predate filterMode/filterList
+        return {
+            enabled:    !!(raw?.enabled),
+            reactOn:    !!(raw?.reactOn),
+            filterMode: raw?.filterMode  || 'none',
+            filterList: Array.isArray(raw?.filterList) ? raw.filterList : []
+        };
     } catch {
         return { enabled: false, reactOn: false, filterMode: 'none', filterList: [] };
     }
