@@ -4,11 +4,11 @@ import path from 'path';
 import { dataFile } from '../lib/paths.js';
 import store from '../lib/lightweight_store.js';
 
-const MONGO_URL = process.env.MONGO_URL;
+const MONGO_URL    = process.env.MONGO_URL;
 const POSTGRES_URL = process.env.POSTGRES_URL;
-const MYSQL_URL = process.env.MYSQL_URL;
-const SQLITE_URL = process.env.DB_URL;
-const HAS_DB = !!(MONGO_URL || POSTGRES_URL || MYSQL_URL || SQLITE_URL);
+const MYSQL_URL    = process.env.MYSQL_URL;
+const SQLITE_URL   = process.env.DB_URL;
+const HAS_DB       = !!(MONGO_URL || POSTGRES_URL || MYSQL_URL || SQLITE_URL);
 
 const configPath = dataFile('autoStatus.json');
 
@@ -17,10 +17,10 @@ if (!HAS_DB && !fs.existsSync(configPath)) {
         fs.mkdirSync(path.dirname(configPath), { recursive: true });
     }
     fs.writeFileSync(configPath, JSON.stringify({
-        enabled: false,
-        reactOn: false,
-        filterMode: 'none',   // 'none' | 'whitelist' | 'blacklist'
-        filterList: []        // array of phone numbers e.g. ["2348012345678"]
+        enabled:    false,
+        reactOn:    false,
+        filterMode: 'none',
+        filterList: []
     }, null, 2));
 }
 
@@ -29,23 +29,132 @@ const channelInfo = {
         forwardingScore: 1,
         isForwarded: true,
         forwardedNewsletterMessageInfo: {
-            newsletterJid: '120363319098372999@newsletter',
-            newsletterName: 'GlobalTechInc',
+            newsletterJid:   '120363319098372999@newsletter',
+            newsletterName:  'GlobalTechInc',
             serverMessageId: -1
         }
     }
 };
 
+// ── De-duplicate triggers ─────────────────────────────────────────────────────
+// Both messages.upsert AND status.update fire for the same status in Baileys.
+// Without dedup, every status is processed twice — and if one path bypasses
+// the filter, the status gets viewed regardless. We track message IDs so only
+// the first arrival is acted on.
+const _processedStatusIds = new Map<string, number>();
+setInterval(() => {
+    const now = Date.now();
+    for (const [id, ts] of _processedStatusIds) {
+        if (now - ts > 5 * 60 * 1000) _processedStatusIds.delete(id);
+    }
+}, 60_000);
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-/** Strip everything from a JID/number leaving only the numeric part */
+/** Strip everything from a raw JID/number, returning only digits. */
 function cleanNumber(raw: string): string {
+    if (!raw) return '';
     return raw
-        .replace('@s.whatsapp.net', '')
-        .replace('@lid', '')
-        .replace('@g.us', '')
+        .replace(/@s\.whatsapp\.net/g, '')
+        .replace(/@lid/g, '')
+        .replace(/@g\.us/g, '')
+        .replace(/@broadcast/g, '')
         .replace(/\D/g, '')
         .split(':')[0];
+}
+
+/**
+ * Resolve a JID to a plain phone number string.
+ *
+ * Problem: newer WhatsApp/Baileys versions use @lid (device-layer) JIDs for
+ * status senders instead of @s.whatsapp.net. A @lid value like "123456@lid"
+ * is NOT the user's phone number — it's a device identifier. We must look it
+ * up in the contact store to get the real phone number; otherwise the filter
+ * can never match a number the owner added.
+ */
+function resolvePhoneNumber(rawJid: string, sock: any): string {
+    if (!rawJid) return '';
+
+    // Already a normal JID — just extract the number
+    if (rawJid.includes('@s.whatsapp.net')) {
+        return cleanNumber(rawJid);
+    }
+
+    // @lid JID — look it up in the store contacts
+    if (rawJid.includes('@lid') && sock?.store?.contacts) {
+        const contacts = sock.store.contacts as Record<string, any>;
+        const lidBase  = rawJid.split(':')[0].split('@')[0];
+
+        for (const [jid, contact] of Object.entries(contacts)) {
+            if (!jid.includes('@s.whatsapp.net')) continue;
+            const contactLid: string = contact?.lid || '';
+            const lidNum = contactLid.split(':')[0].split('@')[0];
+            if (lidNum && lidNum === lidBase) {
+                return cleanNumber(jid); // resolved to real phone number
+            }
+        }
+
+        // Cannot resolve — return empty string.
+        // shouldViewStatus treats empty as "unknown" and applies safe default:
+        //   blacklist → allow  (unknown contact, safer to view)
+        //   whitelist → deny   (unknown contact, not on whitelist)
+        console.log(`[autostatus] ⚠️ Unresolvable @lid JID: ${rawJid}`);
+        return '';
+    }
+
+    return cleanNumber(rawJid);
+}
+
+/**
+ * Extract the sender JID from whatever shape the Baileys status event arrives in.
+ * Returns null if the event isn't a status broadcast we should act on.
+ */
+function extractSenderJid(status: any): string | null {
+    // Shape 1: messages.upsert chatUpdate → { messages: [...], type: '...' }
+    if (Array.isArray(status?.messages) && status.messages.length > 0) {
+        const msg = status.messages[0];
+        if (msg?.key?.remoteJid === 'status@broadcast') {
+            return msg.key.participant || null;
+        }
+    }
+
+    // Shape 2: status.update event → array of WAMessage directly
+    if (Array.isArray(status) && status.length > 0) {
+        const msg = status[0];
+        if (msg?.key?.remoteJid === 'status@broadcast') {
+            return msg.key.participant || null;
+        }
+    }
+
+    // Shape 3: bare message key
+    if (status?.key?.remoteJid === 'status@broadcast') {
+        return status.key.participant || null;
+    }
+
+    // Shape 4: reaction event
+    if (status?.reaction?.key?.remoteJid === 'status@broadcast') {
+        return status.reaction.key.participant || null;
+    }
+
+    return null;
+}
+
+/** Extract the message ID for dedup. */
+function extractStatusId(status: any): string | null {
+    if (Array.isArray(status?.messages) && status.messages[0]?.key?.id) return status.messages[0].key.id;
+    if (Array.isArray(status) && status[0]?.key?.id) return status[0].key.id;
+    if (status?.key?.id) return status.key.id;
+    if (status?.reaction?.key?.id) return status.reaction.key.id;
+    return null;
+}
+
+/** Extract the actual message key for readMessages / react calls. */
+function extractMessageKey(status: any): any | null {
+    if (Array.isArray(status?.messages) && status.messages[0]?.key) return status.messages[0].key;
+    if (Array.isArray(status) && status[0]?.key) return status[0].key;
+    if (status?.key) return status.key;
+    if (status?.reaction?.key) return status.reaction.key;
+    return null;
 }
 
 // ── Config helpers ────────────────────────────────────────────────────────────
@@ -58,60 +167,65 @@ async function readConfig() {
         } else {
             raw = JSON.parse(fs.readFileSync(configPath, 'utf8'));
         }
-        // Always normalise — handles old configs that predate filterMode/filterList
+        // Always normalise — handles configs saved before filterMode/filterList existed
         return {
             enabled:    !!(raw?.enabled),
             reactOn:    !!(raw?.reactOn),
-            filterMode: raw?.filterMode  || 'none',
-            filterList: Array.isArray(raw?.filterList) ? raw.filterList : []
+            filterMode: (raw?.filterMode as string) || 'none',
+            filterList: Array.isArray(raw?.filterList) ? (raw.filterList as string[]) : []
         };
     } catch {
-        return { enabled: false, reactOn: false, filterMode: 'none', filterList: [] };
+        return { enabled: false, reactOn: false, filterMode: 'none', filterList: [] as string[] };
     }
 }
 
-async function writeConfig(config: any) {
+async function writeConfig(cfg: any) {
     try {
         if (HAS_DB) {
-            await store.saveSetting('global', 'autoStatus', config);
+            await store.saveSetting('global', 'autoStatus', cfg);
         } else {
-            fs.writeFileSync(configPath, JSON.stringify(config, null, 2));
+            fs.writeFileSync(configPath, JSON.stringify(cfg, null, 2));
         }
     } catch (error: any) {
-        console.error('Error writing auto status config:', error);
+        console.error('[autostatus] Error writing config:', error);
     }
 }
 
 // ── Filter logic ──────────────────────────────────────────────────────────────
 
 /**
- * Returns true if the bot should view/react to this status sender.
+ * Decide whether the bot should view/react to this sender's status.
  *
- * filterMode = 'none'       → always view everyone
+ * filterMode = 'none'       → view everyone
  * filterMode = 'whitelist'  → view ONLY numbers in filterList
  * filterMode = 'blacklist'  → view everyone EXCEPT numbers in filterList
+ *
+ * If phoneNum is empty (unresolvable @lid):
+ *   blacklist → allow  (unknown, safer to view)
+ *   whitelist → deny   (unknown, not on whitelist)
  */
-async function shouldViewStatus(senderJid: string): Promise<boolean> {
-    const config = await readConfig();
-    if (!config.enabled) return false;
+async function shouldViewStatus(phoneNum: string): Promise<boolean> {
+    const cfg = await readConfig();
+    if (!cfg.enabled) return false;
+    if (!cfg.filterMode || cfg.filterMode === 'none') return true;
 
-    const { filterMode, filterList } = config;
-    if (!filterMode || filterMode === 'none') return true;
+    if (!phoneNum) {
+        return cfg.filterMode === 'blacklist';
+    }
 
-    const senderNum = cleanNumber(senderJid);
-    const inList = (filterList as string[]).some(n => cleanNumber(n) === senderNum);
+    const inList = cfg.filterList.some(n => cleanNumber(n) === phoneNum);
 
-    if (filterMode === 'whitelist') return inList;
-    if (filterMode === 'blacklist') return !inList;
+    if (cfg.filterMode === 'whitelist') return inList;
+    if (cfg.filterMode === 'blacklist') return !inList;
     return true;
 }
 
 // ── Status reaction ───────────────────────────────────────────────────────────
 
-async function reactToStatus(sock: any, statusKey: any) {
+async function reactToStatus(sock: any, key: any) {
     try {
-        const config = await readConfig();
-        if (!config.reactOn) return;
+        const cfg = await readConfig();
+        if (!cfg.reactOn) return;
 
         await sock.relayMessage(
             'status@broadcast',
@@ -119,21 +233,21 @@ async function reactToStatus(sock: any, statusKey: any) {
                 reactionMessage: {
                     key: {
                         remoteJid:   'status@broadcast',
-                        id:          statusKey.id,
-                        participant: statusKey.participant || statusKey.remoteJid,
+                        id:          key.id,
+                        participant: key.participant || key.remoteJid,
                         fromMe:      false
                     },
                     text: '💚'
                 }
             },
             {
-                messageId:     statusKey.id,
-                statusJidList: [statusKey.remoteJid, statusKey.participant || statusKey.remoteJid]
+                messageId:     key.id,
+                statusJidList: [key.remoteJid, key.participant || key.remoteJid]
             }
         );
-        console.log('✅ Reacted to status');
+        console.log('[autostatus] ✅ Reacted to status');
     } catch (error: any) {
-        console.error('❌ Error reacting to status:', error.message);
+        console.error('[autostatus] ❌ React error:', error.message);
     }
 }
 
@@ -141,68 +255,50 @@ async function reactToStatus(sock: any, statusKey: any) {
 
 async function handleStatusUpdate(sock: any, status: any) {
     try {
-        // Resolve the sender JID from whatever shape the event arrives in
-        let senderJid: string | null = null;
-
-        if (status.messages?.length > 0) {
-            const msg = status.messages[0];
-            if (msg.key?.remoteJid === 'status@broadcast') {
-                senderJid = msg.key.participant || msg.key.remoteJid;
-            }
-        } else if (status.key?.remoteJid === 'status@broadcast') {
-            senderJid = status.key.participant || status.key.remoteJid;
-        } else if (status.reaction?.key?.remoteJid === 'status@broadcast') {
-            senderJid = status.reaction.key.participant || status.reaction.key.remoteJid;
+        // 1. De-duplicate — both messages.upsert and status.update fire for the
+        //    same status; we must only act on the first one that arrives.
+        const msgId = extractStatusId(status);
+        if (msgId) {
+            if (_processedStatusIds.has(msgId)) return;
+            _processedStatusIds.set(msgId, Date.now());
         }
 
-        if (!senderJid) return;
+        // 2. Extract sender JID
+        const rawSenderJid = extractSenderJid(status);
+        if (!rawSenderJid) return;
 
-        // Apply filter check
-        const allowed = await shouldViewStatus(senderJid);
+        // 3. Resolve @lid to real phone number via store contacts
+        const phoneNum = resolvePhoneNumber(rawSenderJid, sock);
+        console.log(`[autostatus] 📲 Status from: ${phoneNum || rawSenderJid}`);
+
+        // 4. Apply filter
+        const allowed = await shouldViewStatus(phoneNum);
         if (!allowed) {
-            console.log(`⏭️ Skipped status from ${cleanNumber(senderJid)} (filter)`);
+            console.log(`[autostatus] ⏭️ Skipped (blacklisted): ${phoneNum}`);
             return;
         }
+
+        // 5. View + react
+        const key = extractMessageKey(status);
+        if (!key) return;
 
         await new Promise(resolve => setTimeout(resolve, 1000));
 
-        // Helper to read + react, with rate-limit retry
-        const readAndReact = async (key: any) => {
-            try {
+        try {
+            await sock.readMessages([key]);
+            console.log(`[autostatus] ✅ Viewed status from: ${phoneNum || rawSenderJid}`);
+            await reactToStatus(sock, key);
+        } catch (err: any) {
+            if (err.message?.includes('rate-overlimit')) {
+                await new Promise(r => setTimeout(r, 2000));
                 await sock.readMessages([key]);
-                await reactToStatus(sock, key);
-            } catch (err: any) {
-                if (err.message?.includes('rate-overlimit')) {
-                    await new Promise(r => setTimeout(r, 2000));
-                    await sock.readMessages([key]);
-                } else {
-                    throw err;
-                }
+            } else {
+                throw err;
             }
-        };
-
-        if (status.messages?.length > 0) {
-            const msg = status.messages[0];
-            if (msg.key?.remoteJid === 'status@broadcast') {
-                await readAndReact(msg.key);
-                console.log('✅ Viewed status from messages');
-                return;
-            }
-        }
-
-        if (status.key?.remoteJid === 'status@broadcast') {
-            await readAndReact(status.key);
-            console.log('✅ Viewed status from key');
-            return;
-        }
-
-        if (status.reaction?.key?.remoteJid === 'status@broadcast') {
-            await readAndReact(status.reaction.key);
-            console.log('✅ Viewed status from reaction');
         }
 
     } catch (error: any) {
-        console.error('❌ Error in auto status view:', error.message);
+        console.error('[autostatus] ❌ handleStatusUpdate error:', error.message);
     }
 }
 
@@ -216,39 +312,38 @@ export default {
     usage: '.autostatus <on|off|react on|react off|whitelist|blacklist|add|remove|list|reset>',
     ownerOnly: true,
 
-    async handler(sock: any, message: any, args: any[], context: BotContext) {
+    async handler(sock: any, message: any, args: string[], context: BotContext) {
         const chatId = context.chatId || message.key.remoteJid;
 
         try {
-            const config = await readConfig();
+            const cfg = await readConfig();
 
-            // ── No args → show status ─────────────────────────────────────
+            // ── No args → show current settings ──────────────────────────────
             if (!args || args.length === 0) {
-                const viewStatus  = config.enabled    ? '✅ Enabled'  : '❌ Disabled';
-                const reactStatus = config.reactOn    ? '✅ Enabled'  : '❌ Disabled';
-                const modeLabel   = config.filterMode === 'none'
-                    ? '🌐 View everyone'
-                    : config.filterMode === 'whitelist'
-                        ? `✅ Whitelist (${(config.filterList as string[]).length} contacts)`
-                        : `🚫 Blacklist (${(config.filterList as string[]).length} contacts)`;
+                const viewLabel  = cfg.enabled ? '✅ Enabled'  : '❌ Disabled';
+                const reactLabel = cfg.reactOn  ? '✅ Enabled'  : '❌ Disabled';
+                const modeLabel  =
+                    cfg.filterMode === 'whitelist' ? `✅ Whitelist (${cfg.filterList.length} contacts)` :
+                    cfg.filterMode === 'blacklist' ? `🚫 Blacklist (${cfg.filterList.length} contacts)` :
+                    '🌐 None (view everyone)';
 
                 return await sock.sendMessage(chatId, {
                     text:
                         `🔄 *Auto Status Settings*\n\n` +
-                        `📱 *Auto View:*      ${viewStatus}\n` +
-                        `💫 *Auto React:*     ${reactStatus}\n` +
-                        `🎯 *Filter Mode:*    ${modeLabel}\n\n` +
+                        `📱 *Auto View:*    ${viewLabel}\n` +
+                        `💫 *Auto React:*   ${reactLabel}\n` +
+                        `🎯 *Filter Mode:*  ${modeLabel}\n\n` +
                         `*── Toggle ──*\n` +
-                        `• \`.autostatus on/off\`          — Enable/disable auto view\n` +
-                        `• \`.autostatus react on/off\`    — Enable/disable reactions\n\n` +
+                        `• \`.autostatus on/off\`           — Enable/disable auto view\n` +
+                        `• \`.autostatus react on/off\`     — Enable/disable reactions\n\n` +
                         `*── Filter Mode ──*\n` +
-                        `• \`.autostatus whitelist\`        — View ONLY listed contacts\n` +
-                        `• \`.autostatus blacklist\`        — View everyone EXCEPT listed\n` +
-                        `• \`.autostatus reset\`            — Remove all filters (view all)\n\n` +
+                        `• \`.autostatus whitelist\`         — View ONLY listed contacts\n` +
+                        `• \`.autostatus blacklist\`         — Skip listed contacts\n` +
+                        `• \`.autostatus reset\`             — Remove all filters\n\n` +
                         `*── Manage List ──*\n` +
-                        `• \`.autostatus add 2348012345678\`   — Add a number\n` +
-                        `• \`.autostatus remove 2348012345678\` — Remove a number\n` +
-                        `• \`.autostatus list\`               — Show current filter list`,
+                        `• \`.autostatus add 2348012345678\`    — Add number\n` +
+                        `• \`.autostatus remove 2348012345678\` — Remove number\n` +
+                        `• \`.autostatus list\`                 — Show filter list`,
                     ...channelInfo
                 }, { quoted: message });
             }
@@ -256,10 +351,10 @@ export default {
             const cmd  = args[0].toLowerCase();
             const arg2 = args[1]?.toLowerCase();
 
-            // ── on / off ──────────────────────────────────────────────────
+            // ── on / off ──────────────────────────────────────────────────────
             if (cmd === 'on') {
-                config.enabled = true;
-                await writeConfig(config);
+                cfg.enabled = true;
+                await writeConfig(cfg);
                 return await sock.sendMessage(chatId, {
                     text: '✅ *Auto status view enabled!*',
                     ...channelInfo
@@ -267,15 +362,15 @@ export default {
             }
 
             if (cmd === 'off') {
-                config.enabled = false;
-                await writeConfig(config);
+                cfg.enabled = false;
+                await writeConfig(cfg);
                 return await sock.sendMessage(chatId, {
                     text: '❌ *Auto status view disabled!*',
                     ...channelInfo
                 }, { quoted: message });
             }
 
-            // ── react on / off ────────────────────────────────────────────
+            // ── react on / off ────────────────────────────────────────────────
             if (cmd === 'react') {
                 if (!arg2 || !['on', 'off'].includes(arg2)) {
                     return await sock.sendMessage(chatId, {
@@ -283,41 +378,41 @@ export default {
                         ...channelInfo
                     }, { quoted: message });
                 }
-                config.reactOn = arg2 === 'on';
-                await writeConfig(config);
+                cfg.reactOn = arg2 === 'on';
+                await writeConfig(cfg);
                 return await sock.sendMessage(chatId, {
-                    text: config.reactOn
+                    text: cfg.reactOn
                         ? '💫 *Status reactions enabled!* Bot will react with 💚'
                         : '❌ *Status reactions disabled!*',
                     ...channelInfo
                 }, { quoted: message });
             }
 
-            // ── whitelist / blacklist ─────────────────────────────────────
+            // ── whitelist / blacklist ─────────────────────────────────────────
             if (cmd === 'whitelist' || cmd === 'blacklist') {
-                config.filterMode = cmd;
-                await writeConfig(config);
+                cfg.filterMode = cmd;
+                await writeConfig(cfg);
+                const hint = cfg.filterList.length === 0
+                    ? '\n\n💡 *Tip:* List is empty. Use `.autostatus add <number>` to populate it.'
+                    : '';
                 const modeText = cmd === 'whitelist'
-                    ? '✅ *Whitelist mode ON*\nBot will view status of ONLY contacts in your list.\nUse `.autostatus add <number>` to populate the list.'
-                    : '🚫 *Blacklist mode ON*\nBot will view everyone\'s status EXCEPT contacts in your list.\nUse `.autostatus add <number>` to add people to skip.';
-                return await sock.sendMessage(chatId, {
-                    text: modeText,
-                    ...channelInfo
-                }, { quoted: message });
+                    ? `✅ *Whitelist mode ON*\nBot will view ONLY contacts in your list.${hint}`
+                    : `🚫 *Blacklist mode ON*\nBot will skip contacts in your list.${hint}`;
+                return await sock.sendMessage(chatId, { text: modeText, ...channelInfo }, { quoted: message });
             }
 
-            // ── reset ─────────────────────────────────────────────────────
+            // ── reset ─────────────────────────────────────────────────────────
             if (cmd === 'reset') {
-                config.filterMode = 'none';
-                config.filterList = [];
-                await writeConfig(config);
+                cfg.filterMode = 'none';
+                cfg.filterList = [];
+                await writeConfig(cfg);
                 return await sock.sendMessage(chatId, {
                     text: '🌐 *Filter reset!* Bot will now view everyone\'s status.',
                     ...channelInfo
                 }, { quoted: message });
             }
 
-            // ── add <number> ──────────────────────────────────────────────
+            // ── add <number> ──────────────────────────────────────────────────
             if (cmd === 'add') {
                 if (!args[1]) {
                     return await sock.sendMessage(chatId, {
@@ -325,38 +420,31 @@ export default {
                         ...channelInfo
                     }, { quoted: message });
                 }
-
                 const num = cleanNumber(args[1]);
                 if (num.length < 7) {
                     return await sock.sendMessage(chatId, {
-                        text: '❌ Invalid number format. Use international format without +\nExample: `2348012345678`',
+                        text: '❌ Invalid format. Use international digits only, no + or spaces.\nExample: `2348012345678`',
                         ...channelInfo
                     }, { quoted: message });
                 }
-
-                const list: string[] = config.filterList || [];
-                if (list.some(n => cleanNumber(n) === num)) {
+                if (cfg.filterList.some(n => cleanNumber(n) === num)) {
                     return await sock.sendMessage(chatId, {
                         text: `⚠️ *${num}* is already in the list.`,
                         ...channelInfo
                     }, { quoted: message });
                 }
-
-                list.push(num);
-                config.filterList = list;
-                await writeConfig(config);
-
-                const modeHint = config.filterMode === 'none'
-                    ? '\n\n💡 *Tip:* You haven\'t set a filter mode yet. Use `.autostatus whitelist` or `.autostatus blacklist` to activate filtering.'
+                cfg.filterList.push(num);
+                await writeConfig(cfg);
+                const modeHint = cfg.filterMode === 'none'
+                    ? '\n\n💡 *Tip:* Set a mode: `.autostatus whitelist` or `.autostatus blacklist`'
                     : '';
-
                 return await sock.sendMessage(chatId, {
-                    text: `✅ *${num}* added to filter list. (${list.length} total)${modeHint}`,
+                    text: `✅ *${num}* added. (${cfg.filterList.length} total)${modeHint}`,
                     ...channelInfo
                 }, { quoted: message });
             }
 
-            // ── remove <number> ───────────────────────────────────────────
+            // ── remove <number> ───────────────────────────────────────────────
             if (cmd === 'remove') {
                 if (!args[1]) {
                     return await sock.sendMessage(chatId, {
@@ -364,60 +452,49 @@ export default {
                         ...channelInfo
                     }, { quoted: message });
                 }
-
                 const num = cleanNumber(args[1]);
-                const list: string[] = config.filterList || [];
-                const before = list.length;
-                config.filterList = list.filter(n => cleanNumber(n) !== num);
-
-                if (config.filterList.length === before) {
+                const before = cfg.filterList.length;
+                cfg.filterList = cfg.filterList.filter(n => cleanNumber(n) !== num);
+                if (cfg.filterList.length === before) {
                     return await sock.sendMessage(chatId, {
                         text: `⚠️ *${num}* was not found in the list.`,
                         ...channelInfo
                     }, { quoted: message });
                 }
-
-                await writeConfig(config);
+                await writeConfig(cfg);
                 return await sock.sendMessage(chatId, {
-                    text: `✅ *${num}* removed from filter list. (${config.filterList.length} remaining)`,
+                    text: `✅ *${num}* removed. (${cfg.filterList.length} remaining)`,
                     ...channelInfo
                 }, { quoted: message });
             }
 
-            // ── list ──────────────────────────────────────────────────────
+            // ── list ──────────────────────────────────────────────────────────
             if (cmd === 'list') {
-                const list: string[] = config.filterList || [];
-                if (list.length === 0) {
+                if (cfg.filterList.length === 0) {
                     return await sock.sendMessage(chatId, {
-                        text: `📋 *Filter List is empty.*\n\nCurrent mode: *${config.filterMode || 'none'}*\n\nUse \`.autostatus add <number>\` to add contacts.`,
+                        text: `📋 *Filter list is empty.*\nMode: *${cfg.filterMode}*\n\nUse \`.autostatus add <number>\` to add contacts.`,
                         ...channelInfo
                     }, { quoted: message });
                 }
-
-                const modeLabel = config.filterMode === 'whitelist'
-                    ? '✅ Whitelist — viewing ONLY these'
-                    : config.filterMode === 'blacklist'
-                        ? '🚫 Blacklist — skipping these'
-                        : '⚠️ No mode set (list unused until you run `.autostatus whitelist` or `.autostatus blacklist`)';
-
-                const numbered = list.map((n, i) => `${i + 1}. ${n}`).join('\n');
-
+                const modeLabel =
+                    cfg.filterMode === 'whitelist' ? '✅ Whitelist — viewing ONLY these' :
+                    cfg.filterMode === 'blacklist' ? '🚫 Blacklist — skipping these' :
+                    '⚠️ No mode active (run `.autostatus whitelist` or `.autostatus blacklist`)';
+                const numbered = cfg.filterList.map((n, i) => `${i + 1}. ${n}`).join('\n');
                 return await sock.sendMessage(chatId, {
-                    text: `📋 *Filter List* (${list.length})\nMode: ${modeLabel}\n\n${numbered}`,
+                    text: `📋 *Filter List* (${cfg.filterList.length})\nMode: ${modeLabel}\n\n${numbered}`,
                     ...channelInfo
                 }, { quoted: message });
             }
 
-            // ── unknown command ───────────────────────────────────────────
+            // ── unknown ───────────────────────────────────────────────────────
             await sock.sendMessage(chatId, {
-                text:
-                    '❌ *Unknown sub-command.*\n\n' +
-                    'Run `.autostatus` with no arguments to see all options.',
+                text: '❌ Unknown sub-command. Run `.autostatus` to see all options.',
                 ...channelInfo
             }, { quoted: message });
 
         } catch (error: any) {
-            console.error('Error in autostatus command:', error);
+            console.error('[autostatus] Command error:', error);
             await sock.sendMessage(chatId, {
                 text: `❌ *Error:* ${error.message}`,
                 ...channelInfo
@@ -425,7 +502,7 @@ export default {
         }
     },
 
-    // Exported for use in index.ts / messageHandler
+    // Exported for messageHandler.ts
     handleStatusUpdate,
     shouldViewStatus,
     readConfig,
