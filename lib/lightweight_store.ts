@@ -1775,7 +1775,8 @@ const store = {
             id: contact.id,
             name: contact.notify || contact.name || contact.verifiedName || '',
             notify: contact.notify,
-            verifiedName: contact.verifiedName
+            verifiedName: contact.verifiedName,
+            lid: contact.lid
           }
 
           if (backend === 'memory') {
@@ -1798,7 +1799,8 @@ const store = {
             id: contact.id,
             name: contact.notify || contact.name || contact.verifiedName || '',
             notify: contact.notify,
-            verifiedName: contact.verifiedName
+            verifiedName: contact.verifiedName,
+            lid: contact.lid
           }
 
           if (backend === 'memory') {

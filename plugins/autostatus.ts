@@ -80,26 +80,53 @@ function resolvePhoneNumber(rawJid: string, sock: any): string {
         return cleanNumber(rawJid);
     }
 
-    // @lid JID — look it up in the store contacts
-    if (rawJid.includes('@lid') && sock?.store?.contacts) {
-        const contacts = sock.store.contacts as Record<string, any>;
-        const lidBase  = rawJid.split(':')[0].split('@')[0];
+    const contacts = {
+        ...(store?.contacts || {}),
+        ...(sock?.store?.contacts || {})
+    } as Record<string, any>;
 
+    if (rawJid.includes('@lid')) {
+        const lidNumeric = rawJid.split('@')[0].split(':')[0];
+        const lidJid = `${lidNumeric}@lid`;
+        const normalJid = `${lidNumeric}@s.whatsapp.net`;
+
+        // Direct match by raw @lid JID or equivalent key
+        const directContact = contacts[rawJid] || contacts[lidJid] || contacts[normalJid];
+        if (directContact) {
+            const resolvedJid = directContact.id || directContact.lid || directContact.notify || rawJid;
+            if (typeof resolvedJid === 'string' && resolvedJid.includes('@s.whatsapp.net')) {
+                return cleanNumber(resolvedJid);
+            }
+            return cleanNumber(normalJid);
+        }
+
+        // Search contact store for matching lid or matching numeric base
         for (const [jid, contact] of Object.entries(contacts)) {
-            if (!jid.includes('@s.whatsapp.net')) continue;
-            const contactLid: string = contact?.lid || '';
-            const lidNum = contactLid.split(':')[0].split('@')[0];
-            if (lidNum && lidNum === lidBase) {
-                return cleanNumber(jid); // resolved to real phone number
+            if (!contact) continue;
+
+            const contactId = contact.id || jid;
+            const contactLid = contact.lid || '';
+            const contactNum = (contactId || '').split('@')[0].split(':')[0];
+
+            if (contactLid) {
+                const lidBase = contactLid.split('@')[0].split(':')[0];
+                if (lidBase === lidNumeric || contactLid === rawJid || contactLid === lidJid) {
+                    return cleanNumber(contactId || jid);
+                }
+            }
+
+            if (jid.includes('@s.whatsapp.net') && contactNum === lidNumeric) {
+                return cleanNumber(jid);
+            }
+
+            if (jid.includes('@lid') && contactNum === lidNumeric) {
+                return cleanNumber(jid);
             }
         }
 
-        // Cannot resolve — return empty string.
-        // shouldViewStatus treats empty as "unknown" and applies safe default:
-        //   blacklist → allow  (unknown contact, safer to view)
-        //   whitelist → deny   (unknown contact, not on whitelist)
-        console.log(`[autostatus] ⚠️ Unresolvable @lid JID: ${rawJid}`);
-        return '';
+        const fallbackPhone = cleanNumber(rawJid);
+        console.log(`[autostatus] ⚠️ Unresolvable @lid JID: ${rawJid}. Falling back to digits: ${fallbackPhone}`);
+        return fallbackPhone;
     }
 
     return cleanNumber(rawJid);

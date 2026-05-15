@@ -352,7 +352,11 @@ async function startQasimDev(): Promise<any> {
         QasimDev.ev.on('contacts.update', (update: any[]) => {
             for (const contact of update) {
                 const id = QasimDev.decodeJid(contact.id);
-                if (store && store.contacts) (store.contacts as any)[id] = { id, name: contact.notify };
+                if (store && store.contacts) (store.contacts as any)[id] = {
+                    id,
+                    name: contact.notify,
+                    lid: contact.lid
+                };
             }
         });
 
