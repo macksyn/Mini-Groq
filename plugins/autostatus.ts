@@ -105,12 +105,9 @@ async function fetchAndStoreLids(sock: any, phones: string[]): Promise<void> {
 function cleanNumber(raw: string): string {
     if (!raw) return '';
     return raw
-        .replace(/@s\.whatsapp\.net/g, '')
-        .replace(/@lid/g, '')
-        .replace(/@g\.us/g, '')
-        .replace(/@broadcast/g, '')
-        .replace(/\D/g, '')
-        .split(':')[0];
+        .split('@')[0]   // drop @server suffix first
+        .split(':')[0]   // drop :device suffix (e.g. :0, :13)
+        .replace(/\D/g, '');
 }
 
 /**
