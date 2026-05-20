@@ -66,70 +66,49 @@ function cleanNumber(raw: string): string {
 /**
  * Resolve a JID to a plain phone number string.
  *
- * Problem: newer WhatsApp/Baileys versions use @lid (device-layer) JIDs for
- * status senders instead of @s.whatsapp.net. A @lid value like "123456@lid"
- * is NOT the user's phone number — it's a device identifier. We must look it
- * up in the contact store to get the real phone number; otherwise the filter
- * can never match a number the owner added.
+ * Newer WhatsApp/Baileys versions send status events with @lid JIDs instead
+ * of @s.whatsapp.net. We mirror the exact same lookup used in messageHandler.ts:
+ *   1. Normalise the JID with sock.decodeJid (strips the :device suffix).
+ *   2. Scan sock.store.contacts for an entry whose .lid field matches.
+ *   3. If the matching key is a @s.whatsapp.net JID, extract the phone number.
+ *
+ * Returns an empty string when resolution fails so callers know the number is
+ * unknown — returning raw LID digits would silently break filter comparisons.
  */
 function resolvePhoneNumber(rawJid: string, sock: any): string {
     if (!rawJid) return '';
 
-    // Already a normal JID — just extract the number
+    // Already a normal phone JID — just extract digits
     if (rawJid.includes('@s.whatsapp.net')) {
         return cleanNumber(rawJid);
     }
 
-    const contacts = {
-        ...(store?.contacts || {}),
-        ...(sock?.store?.contacts || {})
-    } as Record<string, any>;
-
-    if (rawJid.includes('@lid')) {
-        const lidNumeric = rawJid.split('@')[0].split(':')[0];
-        const lidJid = `${lidNumeric}@lid`;
-        const normalJid = `${lidNumeric}@s.whatsapp.net`;
-
-        // Direct match by raw @lid JID or equivalent key
-        const directContact = contacts[rawJid] || contacts[lidJid] || contacts[normalJid];
-        if (directContact) {
-            const resolvedJid = directContact.id || directContact.lid || directContact.notify || rawJid;
-            if (typeof resolvedJid === 'string' && resolvedJid.includes('@s.whatsapp.net')) {
-                return cleanNumber(resolvedJid);
-            }
-            return cleanNumber(normalJid);
-        }
-
-        // Search contact store for matching lid or matching numeric base
-        for (const [jid, contact] of Object.entries(contacts)) {
-            if (!contact) continue;
-
-            const contactId = contact.id || jid;
-            const contactLid = contact.lid || '';
-            const contactNum = (contactId || '').split('@')[0].split(':')[0];
-
-            if (contactLid) {
-                const lidBase = contactLid.split('@')[0].split(':')[0];
-                if (lidBase === lidNumeric || contactLid === rawJid || contactLid === lidJid) {
-                    return cleanNumber(contactId || jid);
-                }
-            }
-
-            if (jid.includes('@s.whatsapp.net') && contactNum === lidNumeric) {
-                return cleanNumber(jid);
-            }
-
-            if (jid.includes('@lid') && contactNum === lidNumeric) {
-                return cleanNumber(jid);
-            }
-        }
-
-        const fallbackPhone = cleanNumber(rawJid);
-        console.log(`[autostatus] ⚠️ Unresolvable @lid JID: ${rawJid}. Falling back to digits: ${fallbackPhone}`);
-        return fallbackPhone;
+    if (!rawJid.includes('@lid')) {
+        return cleanNumber(rawJid);
     }
 
-    return cleanNumber(rawJid);
+    // Normalise: strip :device suffix the same way messageHandler does
+    const normalizedLid: string = sock?.decodeJid ? sock.decodeJid(rawJid) : rawJid;
+
+    // Use sock.store.contacts — this is the live Baileys store populated by
+    // contacts.update events. The global `store` object mirrors it but may lag.
+    const contacts: Record<string, any> = (sock as any)?.store?.contacts || store?.contacts || {};
+
+    // Mirror messageHandler.ts lines 131-134 exactly
+    const resolvedKey = Object.keys(contacts).find(k => {
+        const lid = contacts[k]?.lid;
+        if (!lid) return false;
+        return lid === normalizedLid ||
+               lid === rawJid ||
+               lid.split(':')[0] === rawJid.split('@')[0];
+    });
+
+    if (resolvedKey?.includes('@s.whatsapp.net')) {
+        return cleanNumber(resolvedKey);
+    }
+
+    console.log(`[autostatus] ⚠️ Cannot resolve @lid → phone for: ${rawJid} (normalized: ${normalizedLid})`);
+    return '';  // Empty = unknown; prevents LID digits from poisoning filter comparisons
 }
 
 /**
@@ -244,79 +223,20 @@ async function shouldViewStatus(
     if (!cfg.enabled) return false;
     if (!cfg.filterMode || cfg.filterMode === 'none') return true;
 
-    if (!phoneNum && !rawSenderJid) {
-        return cfg.filterMode === 'blacklist';
-    }
-
     // ── Direct phone-number match ─────────────────────────────────────────────
+    // resolvePhoneNumber now returns '' when it can't resolve — never LID digits —
+    // so a non-empty phoneNum here is always a real phone number.
     if (phoneNum) {
         const inList = cfg.filterList.some(n => cleanNumber(n) === phoneNum);
-        if (cfg.filterMode === 'whitelist') {
-            if (inList) return true;
-        } else if (cfg.filterMode === 'blacklist') {
-            if (!inList) return true; // not blocked; carry on to LID check just in case
-            return false;             // explicitly blocked
-        }
+        if (cfg.filterMode === 'whitelist') return inList;
+        if (cfg.filterMode === 'blacklist') return !inList;
     }
 
-    // ── Reverse LID lookup ────────────────────────────────────────────────────
-    // When resolution failed (phoneNum equals LID digits, or is empty) and the
-    // sender arrived as a @lid JID, iterate the filter list and check whether
-    // any of those phone numbers' contact entries map to the sender's LID.
-    if (rawSenderJid?.includes('@lid')) {
-        const senderLidNumeric = rawSenderJid.split('@')[0].split(':')[0];
-
-        const contacts = {
-            ...(store?.contacts || {}),
-            ...(sock?.store?.contacts || {})
-        } as Record<string, any>;
-
-        for (const filterPhone of cfg.filterList) {
-            const cleanPhone = cleanNumber(filterPhone);
-
-            // Look up the contact by their normal phone JID
-            const phoneJid  = `${cleanPhone}@s.whatsapp.net`;
-            const contact   = contacts[phoneJid] || contacts[cleanPhone] || null;
-
-            if (contact?.lid) {
-                const contactLidNumeric = (contact.lid as string).split('@')[0].split(':')[0];
-                if (contactLidNumeric === senderLidNumeric) {
-                    console.log(`[autostatus] 🔍 LID reverse-match: ${rawSenderJid} → ${cleanPhone}`);
-                    if (cfg.filterMode === 'whitelist') return true;
-                    if (cfg.filterMode === 'blacklist') return false;
-                }
-            }
-
-            // Also scan every contact whose key is a @lid JID and whose
-            // resolved phone equals a filter entry
-            for (const [jid, ct] of Object.entries(contacts)) {
-                if (!ct || !jid.includes('@lid')) continue;
-                const jidLidNumeric = jid.split('@')[0].split(':')[0];
-                if (jidLidNumeric !== senderLidNumeric) continue;
-
-                // This contact IS the sender — check if their resolved phone is in our list
-                const resolvedId = ct.id || '';
-                const resolvedPhone = resolvedId.includes('@s.whatsapp.net') ? cleanNumber(resolvedId) : '';
-                if (resolvedPhone && resolvedPhone === cleanPhone) {
-                    console.log(`[autostatus] 🔍 LID contact-scan match: ${rawSenderJid} → ${cleanPhone}`);
-                    if (cfg.filterMode === 'whitelist') return true;
-                    if (cfg.filterMode === 'blacklist') return false;
-                }
-            }
-        }
-
-        // After all checks, no filter-list match was found for this @lid sender
-        if (!phoneNum) {
-            // Completely unresolvable: apply safe default
-            return cfg.filterMode === 'blacklist';
-        }
-    }
-
-    // ── Final decision when only phoneNum is available ────────────────────────
-    const inList = cfg.filterList.some(n => cleanNumber(n) === phoneNum);
-    if (cfg.filterMode === 'whitelist') return inList;
-    if (cfg.filterMode === 'blacklist') return !inList;
-    return true;
+    // ── Phone resolution failed — sender arrived as unresolvable @lid ─────────
+    // Safe defaults: blacklist → allow (unknown contact, safer to view);
+    //                whitelist → deny  (unknown contact, not on the list).
+    console.log(`[autostatus] ⚠️ Filter applied with unresolved sender: ${rawSenderJid}`);
+    return cfg.filterMode === 'blacklist';
 }
 
 // ── Status reaction ───────────────────────────────────────────────────────────
