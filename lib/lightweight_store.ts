@@ -128,6 +128,7 @@ if (MONGO_URL) {
       name: { type: String, default: '' },
       notify: String,
       verifiedName: String,
+      phone: String,
       ts: { type: Number, default: Date.now }
     })
 
