@@ -230,18 +230,90 @@ async function writeConfig(cfg: any) {
  * If phoneNum is empty (unresolvable @lid):
  *   blacklist → allow  (unknown, safer to view)
  *   whitelist → deny   (unknown, not on whitelist)
+ *
+ * When the sender arrives as a @lid JID and the store lookup fails, we also
+ * do a reverse lookup: for every phone number in the filter list we find their
+ * contact entry and compare their stored LID against the sender's LID.
  */
-async function shouldViewStatus(phoneNum: string): Promise<boolean> {
+async function shouldViewStatus(
+    phoneNum: string,
+    rawSenderJid?: string,
+    sock?: any
+): Promise<boolean> {
     const cfg = await readConfig();
     if (!cfg.enabled) return false;
     if (!cfg.filterMode || cfg.filterMode === 'none') return true;
 
-    if (!phoneNum) {
+    if (!phoneNum && !rawSenderJid) {
         return cfg.filterMode === 'blacklist';
     }
 
-    const inList = cfg.filterList.some(n => cleanNumber(n) === phoneNum);
+    // ── Direct phone-number match ─────────────────────────────────────────────
+    if (phoneNum) {
+        const inList = cfg.filterList.some(n => cleanNumber(n) === phoneNum);
+        if (cfg.filterMode === 'whitelist') {
+            if (inList) return true;
+        } else if (cfg.filterMode === 'blacklist') {
+            if (!inList) return true; // not blocked; carry on to LID check just in case
+            return false;             // explicitly blocked
+        }
+    }
 
+    // ── Reverse LID lookup ────────────────────────────────────────────────────
+    // When resolution failed (phoneNum equals LID digits, or is empty) and the
+    // sender arrived as a @lid JID, iterate the filter list and check whether
+    // any of those phone numbers' contact entries map to the sender's LID.
+    if (rawSenderJid?.includes('@lid')) {
+        const senderLidNumeric = rawSenderJid.split('@')[0].split(':')[0];
+
+        const contacts = {
+            ...(store?.contacts || {}),
+            ...(sock?.store?.contacts || {})
+        } as Record<string, any>;
+
+        for (const filterPhone of cfg.filterList) {
+            const cleanPhone = cleanNumber(filterPhone);
+
+            // Look up the contact by their normal phone JID
+            const phoneJid  = `${cleanPhone}@s.whatsapp.net`;
+            const contact   = contacts[phoneJid] || contacts[cleanPhone] || null;
+
+            if (contact?.lid) {
+                const contactLidNumeric = (contact.lid as string).split('@')[0].split(':')[0];
+                if (contactLidNumeric === senderLidNumeric) {
+                    console.log(`[autostatus] 🔍 LID reverse-match: ${rawSenderJid} → ${cleanPhone}`);
+                    if (cfg.filterMode === 'whitelist') return true;
+                    if (cfg.filterMode === 'blacklist') return false;
+                }
+            }
+
+            // Also scan every contact whose key is a @lid JID and whose
+            // resolved phone equals a filter entry
+            for (const [jid, ct] of Object.entries(contacts)) {
+                if (!ct || !jid.includes('@lid')) continue;
+                const jidLidNumeric = jid.split('@')[0].split(':')[0];
+                if (jidLidNumeric !== senderLidNumeric) continue;
+
+                // This contact IS the sender — check if their resolved phone is in our list
+                const resolvedId = ct.id || '';
+                const resolvedPhone = resolvedId.includes('@s.whatsapp.net') ? cleanNumber(resolvedId) : '';
+                if (resolvedPhone && resolvedPhone === cleanPhone) {
+                    console.log(`[autostatus] 🔍 LID contact-scan match: ${rawSenderJid} → ${cleanPhone}`);
+                    if (cfg.filterMode === 'whitelist') return true;
+                    if (cfg.filterMode === 'blacklist') return false;
+                }
+            }
+        }
+
+        // After all checks, no filter-list match was found for this @lid sender
+        if (!phoneNum) {
+            // Completely unresolvable: apply safe default
+            return cfg.filterMode === 'blacklist';
+        }
+    }
+
+    // ── Final decision when only phoneNum is available ────────────────────────
+    const inList = cfg.filterList.some(n => cleanNumber(n) === phoneNum);
     if (cfg.filterMode === 'whitelist') return inList;
     if (cfg.filterMode === 'blacklist') return !inList;
     return true;
@@ -298,10 +370,10 @@ async function handleStatusUpdate(sock: any, status: any) {
         const phoneNum = resolvePhoneNumber(rawSenderJid, sock);
         console.log(`[autostatus] 📲 Status from: ${phoneNum || rawSenderJid}`);
 
-        // 4. Apply filter
-        const allowed = await shouldViewStatus(phoneNum);
+        // 4. Apply filter — pass raw JID + sock so reverse LID lookup works
+        const allowed = await shouldViewStatus(phoneNum, rawSenderJid, sock);
         if (!allowed) {
-            console.log(`[autostatus] ⏭️ Skipped (blacklisted): ${phoneNum}`);
+            console.log(`[autostatus] ⏭️ Skipped (filtered): ${phoneNum || rawSenderJid}`);
             return;
         }
 
