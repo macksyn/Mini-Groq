@@ -1636,6 +1636,7 @@ const store = {
   messageCount: {},
   isPublic: true,
   botMode: 'public',
+  lidToPhone: {},   // lid-numeric → phone-digits, built at runtime from contacts + groups
 
   async readFromFile(filePath = STORE_FILE) {
     try {

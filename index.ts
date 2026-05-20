@@ -349,6 +349,16 @@ async function startQasimDev(): Promise<any> {
             } else return jid;
         };
 
+        /** Populate store.lidToPhone from a contact that has both a phone JID and a lid. */
+        function registerLidPhone(phoneJid: string, lid: string) {
+            if (!phoneJid || !lid) return;
+            if (!phoneJid.includes('@s.whatsapp.net')) return;
+            const phone = phoneJid.split('@')[0].split(':')[0];
+            const lidNorm = lid.split('@')[0].split(':')[0];
+            if (!phone || !lidNorm) return;
+            (store as any).lidToPhone[lidNorm] = phone;
+        }
+
         QasimDev.ev.on('contacts.update', (update: any[]) => {
             for (const contact of update) {
                 const id = QasimDev.decodeJid(contact.id);
@@ -357,6 +367,43 @@ async function startQasimDev(): Promise<any> {
                     name: contact.notify,
                     lid: contact.lid
                 };
+                // If contact has a phone-based id + a lid, record the mapping
+                registerLidPhone(id, contact.lid);
+                // If contact has a lid-based id + notify (some WA versions swap them)
+                if (contact.lid) registerLidPhone(contact.lid, id);
+            }
+        });
+
+        QasimDev.ev.on('contacts.set', (update: any) => {
+            const list: any[] = Array.isArray(update) ? update : (update?.contacts || []);
+            for (const contact of list) {
+                if (!contact?.id) continue;
+                const id = QasimDev.decodeJid(contact.id);
+                registerLidPhone(id, contact.lid);
+                if (contact.lid) registerLidPhone(contact.lid, id);
+            }
+        });
+
+        QasimDev.ev.on('groups.upsert', (groups: any[]) => {
+            for (const group of groups) {
+                if (!Array.isArray(group?.participants)) continue;
+                for (const p of group.participants) {
+                    const pid = p?.id || '';
+                    const plid = p?.lid || '';
+                    registerLidPhone(pid, plid);
+                    if (plid) registerLidPhone(plid, pid);
+                }
+            }
+        });
+
+        QasimDev.ev.on('groups.update', (groups: any[]) => {
+            for (const group of groups) {
+                if (!Array.isArray(group?.participants)) continue;
+                for (const p of group.participants) {
+                    const pid = p?.id || '';
+                    const plid = p?.lid || '';
+                    registerLidPhone(pid, plid);
+                }
             }
         });
 

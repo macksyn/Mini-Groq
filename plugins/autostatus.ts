@@ -49,6 +49,51 @@ setInterval(() => {
     }
 }, 60_000);
 
+// ── LID pre-fetch ─────────────────────────────────────────────────────────────
+// In newer WhatsApp, status senders arrive only as @lid JIDs — the contact store
+// never contains the phone↔LID mapping. sock.onWhatsApp(phone) is the only
+// reliable way to resolve phone → LID. We run it once per session for the whole
+// filter list, and again whenever the list changes.
+let _lidsFetched = false;
+
+export function resetLidFetchFlag() { _lidsFetched = false; }
+
+async function prefetchFilterLids(sock: any): Promise<void> {
+    if (_lidsFetched) return;
+    _lidsFetched = true;
+
+    const cfg = await readConfig();
+    if (!cfg.filterList.length || cfg.filterMode === 'none') return;
+
+    console.log(`[autostatus] 🔍 Resolving LIDs for ${cfg.filterList.length} filter entries via onWhatsApp...`);
+    await fetchAndStoreLids(sock, cfg.filterList);
+}
+
+async function fetchAndStoreLids(sock: any, phones: string[]): Promise<void> {
+    for (const phone of phones) {
+        const cleanPhone = cleanNumber(phone);
+        if (!cleanPhone || cleanPhone.length < 7) continue;
+        try {
+            const results = await (sock as any).onWhatsApp(cleanPhone);
+            if (!Array.isArray(results) || !results[0]) continue;
+            const r = results[0];
+            // The result may carry lid in r.lid (phone JID result) or r.jid may itself be @lid
+            const lidJid: string = r.lid || (typeof r.jid === 'string' && r.jid.includes('@lid') ? r.jid : '');
+            if (lidJid) {
+                const lidNum = lidJid.split('@')[0].split(':')[0];
+                if ((sock as any)?.store?.lidToPhone) {
+                    (sock as any).store.lidToPhone[lidNum] = cleanPhone;
+                }
+                console.log(`[autostatus] ✅ LID resolved: ${cleanPhone} → ${lidNum}`);
+            } else {
+                console.log(`[autostatus] ℹ️ No LID for ${cleanPhone}, result: ${JSON.stringify(r)}`);
+            }
+        } catch (e: any) {
+            console.log(`[autostatus] ⚠️ onWhatsApp(${cleanPhone}) failed: ${e.message}`);
+        }
+    }
+}
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 /** Strip everything from a raw JID/number, returning only digits. */
@@ -87,14 +132,20 @@ function resolvePhoneNumber(rawJid: string, sock: any): string {
         return cleanNumber(rawJid);
     }
 
-    // Normalise: strip :device suffix the same way messageHandler does
+    // Normalise: strip :device suffix (e.g. 123:0@lid → 123@lid)
     const normalizedLid: string = sock?.decodeJid ? sock.decodeJid(rawJid) : rawJid;
+    const lidNumeric = rawJid.split('@')[0].split(':')[0];
 
-    // Use sock.store.contacts — this is the live Baileys store populated by
-    // contacts.update events. The global `store` object mirrors it but may lag.
+    // ── 1. Fast path: lidToPhone map built from contacts + group participants ──
+    const lidToPhone: Record<string, string> = (sock as any)?.store?.lidToPhone || {};
+    const fromMap = lidToPhone[lidNumeric] || lidToPhone[normalizedLid] || lidToPhone[rawJid];
+    if (fromMap) {
+        return cleanNumber(fromMap);
+    }
+
+    // ── 2. Fallback: scan contacts for one whose .lid field matches ──────────
+    // Mirrors messageHandler.ts lines 131-134 exactly.
     const contacts: Record<string, any> = (sock as any)?.store?.contacts || store?.contacts || {};
-
-    // Mirror messageHandler.ts lines 131-134 exactly
     const resolvedKey = Object.keys(contacts).find(k => {
         const lid = contacts[k]?.lid;
         if (!lid) return false;
@@ -104,10 +155,12 @@ function resolvePhoneNumber(rawJid: string, sock: any): string {
     });
 
     if (resolvedKey?.includes('@s.whatsapp.net')) {
+        // Also cache this so future lookups are instant
+        (sock as any).store.lidToPhone[lidNumeric] = resolvedKey.split('@')[0];
         return cleanNumber(resolvedKey);
     }
 
-    console.log(`[autostatus] ⚠️ Cannot resolve @lid → phone for: ${rawJid} (normalized: ${normalizedLid})`);
+    console.log(`[autostatus] ⚠️ Cannot resolve @lid → phone for: ${rawJid} (lidToPhone size: ${Object.keys(lidToPhone).length})`);
     return '';  // Empty = unknown; prevents LID digits from poisoning filter comparisons
 }
 
@@ -286,11 +339,14 @@ async function handleStatusUpdate(sock: any, status: any) {
         const rawSenderJid = extractSenderJid(status);
         if (!rawSenderJid) return;
 
-        // 3. Resolve @lid to real phone number via store contacts
+        // 3. Ensure filter list LIDs are pre-fetched (once per session)
+        await prefetchFilterLids(sock);
+
+        // 4. Resolve @lid to real phone number
         const phoneNum = resolvePhoneNumber(rawSenderJid, sock);
         console.log(`[autostatus] 📲 Status from: ${phoneNum || rawSenderJid}`);
 
-        // 4. Apply filter — pass raw JID + sock so reverse LID lookup works
+        // 5. Apply filter
         const allowed = await shouldViewStatus(phoneNum, rawSenderJid, sock);
         if (!allowed) {
             console.log(`[autostatus] ⏭️ Skipped (filtered): ${phoneNum || rawSenderJid}`);
@@ -454,6 +510,9 @@ export default {
                 }
                 cfg.filterList.push(num);
                 await writeConfig(cfg);
+                resetLidFetchFlag();
+                // Eagerly resolve the LID for this number so the filter works immediately
+                fetchAndStoreLids(sock, [num]).catch(() => {});
                 const modeHint = cfg.filterMode === 'none'
                     ? '\n\n💡 *Tip:* Set a mode: `.autostatus whitelist` or `.autostatus blacklist`'
                     : '';
