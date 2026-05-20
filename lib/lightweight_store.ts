@@ -471,9 +471,12 @@ if (backend === 'memory' && POSTGRES_URL) {
                   name TEXT,
                   notify TEXT,
                   verified_name TEXT,
+                  phone TEXT,
                   ts BIGINT NOT NULL
                 )
               `)
+
+              await client.query(`ALTER TABLE contacts ADD COLUMN IF NOT EXISTS phone TEXT`).catch(() => {})
 
               await client.query(`
                 CREATE TABLE IF NOT EXISTS chats (
@@ -683,9 +686,9 @@ if (backend === 'memory' && POSTGRES_URL) {
           const client = await pool.connect()
           try {
             await client.query(
-              `INSERT INTO contacts(jid, name, notify, verified_name, ts) VALUES($1, $2, $3, $4, $5)
-               ON CONFLICT (jid) DO UPDATE SET name=$2, notify=$3, verified_name=$4, ts=$5`,
-              [jid, contact.name || '', contact.notify || '', contact.verifiedName || '', Date.now()]
+              `INSERT INTO contacts(jid, name, notify, verified_name, phone, ts) VALUES($1, $2, $3, $4, $5, $6)
+               ON CONFLICT (jid) DO UPDATE SET name=$2, notify=$3, verified_name=$4, phone=COALESCE($5, contacts.phone), ts=$6`,
+              [jid, contact.name || '', contact.notify || '', contact.verifiedName || '', contact.phone || null, Date.now()]
             )
           } finally {
             client.release()
@@ -966,9 +969,12 @@ if (backend === 'memory' && MYSQL_URL) {
                 name TEXT,
                 notify TEXT,
                 verified_name TEXT,
+                phone VARCHAR(50),
                 ts BIGINT NOT NULL
               ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
             `)
+
+            await mysqlConn.execute(`ALTER TABLE contacts ADD COLUMN IF NOT EXISTS phone VARCHAR(50)`).catch(() => {})
 
             await mysqlConn.execute(`
               CREATE TABLE IF NOT EXISTS chats (
@@ -1118,9 +1124,9 @@ if (backend === 'memory' && MYSQL_URL) {
         try {
           const conn = await this.getConn()
           await conn.execute(
-            `INSERT INTO contacts(jid, name, notify, verified_name, ts) VALUES(?, ?, ?, ?, ?)
-             ON DUPLICATE KEY UPDATE name=VALUES(name), notify=VALUES(notify), verified_name=VALUES(verified_name), ts=VALUES(ts)`,
-            [jid, contact.name || '', contact.notify || '', contact.verifiedName || '', Date.now()]
+            `INSERT INTO contacts(jid, name, notify, verified_name, phone, ts) VALUES(?, ?, ?, ?, ?, ?)
+             ON DUPLICATE KEY UPDATE name=VALUES(name), notify=VALUES(notify), verified_name=VALUES(verified_name), phone=COALESCE(VALUES(phone), phone), ts=VALUES(ts)`,
+            [jid, contact.name || '', contact.notify || '', contact.verifiedName || '', contact.phone || null, Date.now()]
           )
         } catch (e) {
           console.error('[MYSQL] Save contact error:', e.message)
@@ -1336,9 +1342,12 @@ if (backend === 'memory' && SQLITE_URL) {
         name TEXT,
         notify TEXT,
         verified_name TEXT,
+        phone TEXT,
         ts INTEGER NOT NULL
       )
     `).run();
+
+    try { sqlite.prepare(`ALTER TABLE contacts ADD COLUMN phone TEXT`).run() } catch(_) {}
 
     sqlite.prepare(`
       CREATE TABLE IF NOT EXISTS chats (
@@ -1381,7 +1390,7 @@ if (backend === 'memory' && SQLITE_URL) {
     const getMetadataStmt = sqlite.prepare(`SELECT value FROM metadata WHERE key=?`);
     const setMetadataStmt = sqlite.prepare(`INSERT OR REPLACE INTO metadata(key, value) VALUES(?, ?)`);
 
-    const saveContactStmt = sqlite.prepare(`INSERT OR REPLACE INTO contacts(jid, name, notify, verified_name, ts) VALUES(?, ?, ?, ?, ?)`);
+    const saveContactStmt = sqlite.prepare(`INSERT OR REPLACE INTO contacts(jid, name, notify, verified_name, phone, ts) VALUES(?, ?, ?, ?, ?, ?)`);
     const getContactStmt = sqlite.prepare(`SELECT * FROM contacts WHERE jid=?`);
     const getAllContactsStmt = sqlite.prepare(`SELECT jid, name, notify FROM contacts`);
 
@@ -1484,7 +1493,7 @@ if (backend === 'memory' && SQLITE_URL) {
 
       saveContact(jid, contact) {
         try {
-          saveContactStmt.run(jid, contact.name || '', contact.notify || '', contact.verifiedName || '', Date.now());
+          saveContactStmt.run(jid, contact.name || '', contact.notify || '', contact.verifiedName || '', contact.phone || null, Date.now());
         } catch (e) {
           console.error('[SQLITE] Save contact error:', e.message);
         }
@@ -1772,12 +1781,14 @@ const store = {
     ev.on('contacts.update', async (contacts) => {
       for (const contact of contacts) {
         if (contact.id) {
+          const phoneFromId = !contact.id.includes('@lid') ? contact.id.split('@')[0].split(':')[0] : undefined
           const contactData = {
             id: contact.id,
             name: contact.notify || contact.name || contact.verifiedName || '',
             notify: contact.notify,
             verifiedName: contact.verifiedName,
-            lid: contact.lid
+            lid: contact.lid,
+            phone: contact.phone || phoneFromId || undefined
           }
 
           if (backend === 'memory') {
@@ -1796,12 +1807,14 @@ const store = {
     ev.on('contacts.set', async (contacts) => {
       for (const contact of contacts) {
         if (contact.id) {
+          const phoneFromId = !contact.id.includes('@lid') ? contact.id.split('@')[0].split(':')[0] : undefined
           const contactData = {
             id: contact.id,
             name: contact.notify || contact.name || contact.verifiedName || '',
             notify: contact.notify,
             verifiedName: contact.verifiedName,
-            lid: contact.lid
+            lid: contact.lid,
+            phone: contact.phone || phoneFromId || undefined
           }
 
           if (backend === 'memory') {
@@ -2150,6 +2163,19 @@ const store = {
   /**
   * Get store statistics
   */
+
+  async saveContact(jid: string, contactData: Record<string, any>) {
+    if (!jid) return
+    if (backend === 'memory') {
+      this.contacts[jid] = { ...this.contacts[jid], ...contactData }
+    } else {
+      try {
+        await adapters[backend].saveContact(jid, contactData)
+      } catch (e: any) {
+        console.error(`[STORE] Failed to save contact:`, e.message)
+      }
+    }
+  },
 
   getStats() {
     let totalMessages = 0

@@ -359,18 +359,29 @@ async function startQasimDev(): Promise<any> {
             (store as any).lidToPhone[lidNorm] = phone;
         }
 
-        QasimDev.ev.on('contacts.update', (update: any[]) => {
+        QasimDev.ev.on('contacts.update', async (update: any[]) => {
             for (const contact of update) {
                 const id = QasimDev.decodeJid(contact.id);
-                if (store && store.contacts) (store.contacts as any)[id] = {
-                    id,
-                    name: contact.notify,
-                    lid: contact.lid
-                };
                 // If contact has a phone-based id + a lid, record the mapping
                 registerLidPhone(id, contact.lid);
-                // If contact has a lid-based id + notify (some WA versions swap them)
                 if (contact.lid) registerLidPhone(contact.lid, id);
+
+                // Resolve phone for @lid contacts via signalRepository and persist
+                if (id.includes('@lid')) {
+                    try {
+                        const lidMapping = (QasimDev as any)?.signalRepository?.lidMapping;
+                        const pnJid: string | null = lidMapping ? await lidMapping.getPNForLID(id) : null;
+                        const phone = pnJid ? pnJid.split('@')[0].split(':')[0] : undefined;
+                        await (store as any).saveContact(id, {
+                            id,
+                            name: contact.notify || contact.name || contact.verifiedName || '',
+                            notify: contact.notify,
+                            verifiedName: contact.verifiedName,
+                            lid: id,
+                            phone: phone || undefined
+                        });
+                    } catch (_) {}
+                }
             }
         });
 

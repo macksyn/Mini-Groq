@@ -79,12 +79,29 @@ async function printMessage(message: any, sock: any) {
             } else {
                 senderName = await getNameWithFallback(senderId, sock, m.pushName)
 
-                const phone = extractPhoneNumber(senderId)
-                if (phone && phone.length >= 10) {
-                    const pn = (PhoneNumber as any)('+' + phone)
-                    senderPhone = pn.valid ? pn.getNumber('international') : phone
+                if (senderId.includes('@lid')) {
+                    // LID sender — resolve to real phone via Baileys' internal mapping
+                    try {
+                        const lidMapping = sock?.signalRepository?.lidMapping
+                        const pnJid: string | null = lidMapping ? await lidMapping.getPNForLID(senderId) : null
+                        if (pnJid) {
+                            const resolvedPhone = pnJid.split('@')[0].split(':')[0]
+                            const pn = (PhoneNumber as any)('+' + resolvedPhone)
+                            senderPhone = pn.valid ? pn.getNumber('international') : resolvedPhone
+                        } else {
+                            senderPhone = ''
+                        }
+                    } catch(e: any) {
+                        senderPhone = ''
+                    }
                 } else {
-                    senderPhone = senderId.split('@')[0].split(':')[0]
+                    const phone = extractPhoneNumber(senderId)
+                    if (phone && phone.length >= 10) {
+                        const pn = (PhoneNumber as any)('+' + phone)
+                        senderPhone = pn.valid ? pn.getNumber('international') : phone
+                    } else {
+                        senderPhone = senderId.split('@')[0].split(':')[0]
+                    }
                 }
             }
         } catch(e: any) {
