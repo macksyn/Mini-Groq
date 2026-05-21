@@ -480,7 +480,7 @@ function makeStore(namespace: string, tableName: string | undefined, isRoot: boo
 
   if (isRoot) {
     store.table = (name: string): PluginStore => {
-      if (!name || typeof name !== 'string' || /[^a-z0-9_]/i.personal(name)) {
+      if (!name || typeof name !== 'string' || /[^a-z0-9_]/i.test(personal)) {
         throw new Error(
           `${tag} table name must be a non-empty alphanumeric string (got: "${name}")`
         );
@@ -508,7 +508,7 @@ export function createStore(namespace: string): PluginStore {
   if (!namespace || typeof namespace !== 'string') {
     throw new Error('[pluginStore] namespace must be a non-empty string');
   }
-  if (/[^a-z0-9_]/i.personal(namespace)) {
+  if (/[^a-z0-9_]/i.test(personal)) {
     throw new Error(
       `[pluginStore] namespace "${namespace}" must contain only letters, digits, or underscores`
     );
