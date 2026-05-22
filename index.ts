@@ -254,6 +254,12 @@ async function startQasimDev(): Promise<any> {
         QasimDev.sendPresenceUpdate = async function (...args: any[]) {
             const ghostMode = await store.getSetting('global', 'stealthMode');
             if (ghostMode && ghostMode.enabled) {
+                const presenceType = args[0];
+                // Allow status changes ('unavailable', 'available') to go through
+                // Only block activity indicators (typing, composing, etc)
+                if (presenceType === 'unavailable' || presenceType === 'available') {
+                    return originalSendPresenceUpdate.apply(this, args);
+                }
                 printLog('info', '👻 Blocked presence update (stealth mode)');
                 return;
             }

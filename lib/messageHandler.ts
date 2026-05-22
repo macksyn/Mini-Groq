@@ -82,8 +82,6 @@ async function handleMessages(sock: any, messageUpdate: any) {
             const ghostMode = await store.getSetting('global', 'stealthMode');
             if (!ghostMode || !ghostMode.enabled) {
                 await handleAutoread(sock, message);
-            } else {
-                printLog('info', '👻 Stealth mode active');
             }
         } catch(err: any) {
             await handleAutoread(sock, message);

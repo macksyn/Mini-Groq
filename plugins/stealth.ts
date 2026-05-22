@@ -40,6 +40,24 @@ export default {
         }
 
         const enabled = action === 'on';
+        
+        // Send presence update BEFORE saving setting to ensure it goes through
+        try {
+            await new Promise(resolve => setTimeout(resolve, 300));
+            if (enabled) {
+                // Send unavailable presence when stealth is ON
+                await sock.sendPresenceUpdate('unavailable');
+            } else {
+                // Send available presence when stealth is OFF
+                await sock.sendPresenceUpdate('available');
+            }
+            // Wait for presence update to be processed
+            await new Promise(resolve => setTimeout(resolve, 500));
+        } catch (e: any) {
+            // Continue even if presence update fails
+        }
+        
+        // Now save the setting after presence is sent
         await store.saveSetting('global', 'stealthMode', { enabled });
 
         let warnings = '';
@@ -59,20 +77,5 @@ export default {
         await sock.sendMessage(chatId, {
             text: `👻 Stealth mode has been turned *${enabled ? 'ON' : 'OFF'}*\n\n${enabled ? '✓ Bot is now in complete stealth mode\n✓ No presence updates\n✓ No typing indicators' : '✓ Presence updates enabled\n✓ Typing indicators enabled (if autotyping is on)'}${warnings}`
         }, { quoted: message });
-
-        // Broadcast presence update to WhatsApp
-        try {
-            if (enabled) {
-                // Send unavailable presence when stealth is ON
-                await new Promise(resolve => setTimeout(resolve, 500));
-                await sock.sendPresenceUpdate('unavailable');
-            } else {
-                // Send available presence when stealth is OFF
-                await new Promise(resolve => setTimeout(resolve, 500));
-                await sock.sendPresenceUpdate('available');
-            }
-        } catch (e: any) {
-            // Silently fail if presence update doesn't work
-        }
     }
 };
