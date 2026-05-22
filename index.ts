@@ -78,6 +78,7 @@ const DATA_DEFAULTS: Record<string, any> = {
     'pmblocker.json': { enabled: false },
     'anticall.json': { enabled: false },
     'stealthMode.json': { enabled: false },
+    'alwaysOnlineMode.json': { enabled: false },
     'autoBio.json': { enabled: false, customBio: null },
     'autoReaction.json': { enabled: false },
     'antidelete.json': { enabled: false },
@@ -221,8 +222,9 @@ async function startQasimDev(): Promise<any> {
         };
         const msgRetryCounterCache = new NodeCache();
 
-        const ghostMode = await store.getSetting('global', 'stealthMode');
-        const isGhostActive = ghostMode && ghostMode.enabled;
+        const alwaysOnlineMode = await store.getSetting('global', 'alwaysOnlineMode');
+        const stealthMode = await store.getSetting('global', 'stealthMode');
+        const isGhostActive = (alwaysOnlineMode?.enabled || stealthMode?.enabled) ?? false;
 
         const QasimDev = makeWASocket({
             version,
@@ -252,30 +254,46 @@ async function startQasimDev(): Promise<any> {
         const originalSendReceipt = QasimDev.sendReceipt;
 
         QasimDev.sendPresenceUpdate = async function (...args: any[]) {
-            const ghostMode = await store.getSetting('global', 'stealthMode');
-            if (ghostMode && ghostMode.enabled) {
+            // Check both new and old setting keys for backward compatibility
+            const alwaysOnlineMode = await store.getSetting('global', 'alwaysOnlineMode');
+            const stealthMode = await store.getSetting('global', 'stealthMode');
+            const isAlwaysOnline = (alwaysOnlineMode?.enabled || stealthMode?.enabled) ?? false;
+
+            if (isAlwaysOnline) {
                 const presenceType = args[0];
-                // Allow status changes ('unavailable', 'available') to go through
-                // Only block activity indicators (typing, composing, etc)
+                const chatId = args[1];
+                
+                // Block all activity indicators (typing, composing, paused, recording, etc)
+                // Only allow status commands (unavailable, available)
+                const blockableTypes = ['composing', 'paused', 'recording', 'video_recording'];
+                
+                if (blockableTypes.includes(presenceType)) {
+                    printLog('info', `👻 Blocked presence update: ${presenceType}`);
+                    return;
+                }
+                
+                // Allow unavailable/available to proceed (from alwaysonline plugin)
                 if (presenceType === 'unavailable' || presenceType === 'available') {
+                    printLog('info', `👻 Allowing status presence: ${presenceType}`);
                     return originalSendPresenceUpdate.apply(this, args);
                 }
-                printLog('info', '👻 Blocked presence update (stealth mode)');
-                return;
             }
+            
             return originalSendPresenceUpdate.apply(this, args);
         };
 
         QasimDev.readMessages = async function (...args: any[]) {
-            const ghostMode = await store.getSetting('global', 'stealthMode');
-            if (ghostMode && ghostMode.enabled) return;
+            const alwaysOnlineMode = await store.getSetting('global', 'alwaysOnlineMode');
+            const stealthMode = await store.getSetting('global', 'stealthMode');
+            if ((alwaysOnlineMode?.enabled || stealthMode?.enabled) ?? false) return;
             return originalReadMessages.apply(this, args);
         };
 
         if (originalSendReceipt) {
             QasimDev.sendReceipt = async function (...args: any[]) {
-                const ghostMode = await store.getSetting('global', 'stealthMode');
-                if (ghostMode && ghostMode.enabled) return;
+                const alwaysOnlineMode = await store.getSetting('global', 'alwaysOnlineMode');
+                const stealthMode = await store.getSetting('global', 'stealthMode');
+                if ((alwaysOnlineMode?.enabled || stealthMode?.enabled) ?? false) return;
                 return originalSendReceipt.apply(this, args);
             };
         }
@@ -291,8 +309,9 @@ async function startQasimDev(): Promise<any> {
         };
 
         QasimDev.isGhostMode = async () => {
-            const ghostMode = await store.getSetting('global', 'stealthMode');
-            return ghostMode && ghostMode.enabled;
+            const alwaysOnlineMode = await store.getSetting('global', 'alwaysOnlineMode');
+            const stealthMode = await store.getSetting('global', 'stealthMode');
+            return (alwaysOnlineMode?.enabled || stealthMode?.enabled) ?? false;
         };
 
         QasimDev.ev.on('creds.update', _saveCreds);
@@ -530,15 +549,20 @@ async function startQasimDev(): Promise<any> {
                     printLog('error', `Failed to start auto bio: ${e.message}`);
                 }
 
-                const ghostMode = await store.getSetting('global', 'stealthMode');
-                if (ghostMode && ghostMode.enabled) {
-                    printLog('info', '👻 STEALTH MODE ACTIVE');
-                    // Broadcast unavailable presence on reconnection if stealth mode is enabled
+                // Check both settings for always online / stealth mode
+                const alwaysOnlineMode = await store.getSetting('global', 'alwaysOnlineMode');
+                const stealthMode = await store.getSetting('global', 'stealthMode');
+                const isAlwaysOnline = (alwaysOnlineMode?.enabled || stealthMode?.enabled) ?? false;
+
+                if (isAlwaysOnline) {
+                    printLog('info', '👻 ALWAYS ONLINE MODE ACTIVE - Setting unavailable presence');
+                    // Send unavailable presence on reconnection if always online mode is enabled
                     try {
-                        await new Promise(resolve => setTimeout(resolve, 1000));
+                        await new Promise(resolve => setTimeout(resolve, 800));
                         await QasimDev.sendPresenceUpdate('unavailable');
+                        printLog('success', '✓ Presence set to unavailable');
                     } catch (e: any) {
-                        // Silently fail if presence update doesn't work
+                        printLog('error', `Failed to set presence: ${e.message}`);
                     }
                 }
 
@@ -546,7 +570,9 @@ async function startQasimDev(): Promise<any> {
 
                 try {
                     const botNumber = QasimDev.user.id.split(':')[0] + '@s.whatsapp.net';
-                    const ghostStatus = (ghostMode && ghostMode.enabled) ? '\n👻 Stealth Mode: ACTIVE' : '';
+                    const alwaysOnlineMode = await store.getSetting('global', 'alwaysOnlineMode');
+                    const stealthMode = await store.getSetting('global', 'stealthMode');
+                    const ghostStatus = (alwaysOnlineMode?.enabled || stealthMode?.enabled) ? '\n👻 Stealth Mode: ACTIVE' : '';
 
                     await QasimDev.sendMessage(botNumber, {
                         text: `🤖 Bot Connected Successfully!\n\n⏰ Time: ${new Date().toLocaleString()}\n✅ Status: Online and Ready!${ghostStatus}\n\n✅Make sure to join our channel`,
