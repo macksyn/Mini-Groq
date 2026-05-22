@@ -527,6 +527,13 @@ async function startQasimDev(): Promise<any> {
                 const ghostMode = await store.getSetting('global', 'stealthMode');
                 if (ghostMode && ghostMode.enabled) {
                     printLog('info', '👻 STEALTH MODE ACTIVE');
+                    // Broadcast unavailable presence on reconnection if stealth mode is enabled
+                    try {
+                        await new Promise(resolve => setTimeout(resolve, 1000));
+                        await QasimDev.sendPresenceUpdate('unavailable');
+                    } catch (e: any) {
+                        // Silently fail if presence update doesn't work
+                    }
                 }
 
                 printLog('success', 'Connected to => ' + JSON.stringify(QasimDev.user, null, 2));
