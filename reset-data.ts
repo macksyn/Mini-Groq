@@ -10,7 +10,6 @@ const defaults = {
     'pmblocker.json':   { enabled: false },
     'anticall.json':    { enabled: false },
     'stealthMode.json': { enabled: false },
-    'alwaysOnlineMode.json': { enabled: false },
     'autoBio.json':     { enabled: false, customBio: null },
     'autoReaction.json':{ enabled: false },
     'messageCount.json':{ isPublic: true, messageCount: {} },
