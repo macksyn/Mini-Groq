@@ -528,6 +528,8 @@ const QasimDev = makeWASocket({
 
                 const ghostOnOpen = await store.getSetting('global', 'stealthMode');
 if (ghostOnOpen?.enabled) {
+  try { const s = await import('./plugins/stealth.js'); s.syncSock?.(QasimDev); } catch(_) {}
+
     printLog('info', '👻 STEALTH MODE ACTIVE — asserting offline presence');
     for (let attempt = 0; attempt < 3; attempt++) {
         await new Promise(r => setTimeout(r, 1500));
