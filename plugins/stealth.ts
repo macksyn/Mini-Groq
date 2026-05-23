@@ -1,28 +1,41 @@
 import type { BotContext } from '../types.js';
 import store from '../lib/lightweight_store.js';
 
-// ── Periodic presence enforcer ────────────────────────────────────────────────
-// WhatsApp's server silently resets a client to "online" after a few minutes
-// regardless of what Baileys sends at connect-time. The only reliable fix is to
-// periodically re-assert "unavailable" while stealth mode is active.
-let _enforcerTimer: ReturnType<typeof setInterval> | null = null;
+// ── Module-level socket reference ─────────────────────────────────────────────
+// Updated from index.ts on EVERY reconnect via syncSock(), so the enforcer
+// never operates on a dead/stale socket after WhatsApp forces a reconnect.
 let _sock: any = null;
+let _enforcerTimer: ReturnType<typeof setInterval> | null = null;
 
-function startEnforcer(sock: any): void {
+// ── Called from index.ts on every connection.update → 'open' ─────────────────
+export function syncSock(sock: any): void {
     _sock = sock;
-    if (_enforcerTimer) return; // already running
+}
+
+// ── Checks whether the underlying WebSocket is still alive ───────────────────
+function isSocketAlive(): boolean {
+    if (!_sock) return false;
+    const ws = _sock.ws;
+    if (ws && typeof ws.readyState === 'number') {
+        return ws.readyState === 1; // WebSocket.OPEN = 1
+    }
+    return true; // unknown state — let try/catch handle it
+}
+
+// ── Enforcer ──────────────────────────────────────────────────────────────────
+// Re-asserts "unavailable" every 45 seconds while stealth is active.
+// 45 s is well within WhatsApp's ~2-3 min auto-reset window.
+function startEnforcer(): void {
+    if (_enforcerTimer) return;
 
     _enforcerTimer = setInterval(async () => {
         try {
             const state = await store.getSetting('global', 'stealthMode');
-            if (!state?.enabled || !_sock) return;
-
-            // Re-assert offline status; silently ignore errors (e.g. during reconnects)
-            await _sock.sendPresenceUpdate('unavailable').catch(() => {});
-        } catch (_) {
-            // Never let the enforcer crash
-        }
-    }, 2 * 60 * 1000); // every 2 minutes
+            if (!state?.enabled) return;
+            if (!isSocketAlive()) return; // wait for next syncSock() call
+            await _sock.sendPresenceUpdate('unavailable');
+        } catch (_) {}
+    }, 45 * 1000);
 }
 
 function stopEnforcer(): void {
@@ -32,39 +45,45 @@ function stopEnforcer(): void {
     }
 }
 
+// ── Assert offline with retries ───────────────────────────────────────────────
+// Sends 'unavailable' multiple times to beat WA's connect-time 'available' ping.
+async function assertOffline(sock: any): Promise<void> {
+    for (let i = 0; i < 4; i++) {
+        await new Promise(r => setTimeout(r, 1200));
+        try { await sock.sendPresenceUpdate('unavailable'); } catch (_) {}
+    }
+}
+
+// ── Plugin lifecycle hook (called once by pluginLoader on first connect) ──────
+export async function onLoad(sock: any): Promise<void> {
+    _sock = sock;
+    const state = await store.getSetting('global', 'stealthMode').catch(() => null);
+    if (state?.enabled) {
+        startEnforcer();
+        await assertOffline(sock);
+    }
+}
+
+// ── Command handler ───────────────────────────────────────────────────────────
 export default {
     command: 'stealth',
     aliases: ['alwaysonline', 'stealthmode'],
     category: 'owner',
-    description: 'Toggle stealth mode — bot will appear permanently offline',
+    description: 'Toggle stealth mode — bot appears permanently offline',
     usage: '.stealth <on|off>',
     ownerOnly: true,
 
-    // ── Called once when the bot connects (pluginLoader lifecycle) ────────────
-    async onLoad(sock: any) {
-        _sock = sock;
-        const state = await store.getSetting('global', 'stealthMode').catch(() => null);
-        if (state?.enabled) {
-            startEnforcer(sock);
-            // Immediately assert offline so there is no window where the bot
-            // appears online after a reconnect.
-            try {
-                await sock.sendPresenceUpdate('unavailable');
-            } catch (_) {}
-        }
-    },
+    onLoad, // re-exported so pluginLoader.ts picks it up via plugin.onLoad
 
     async handler(sock: any, message: any, args: any, context: BotContext) {
         const { chatId } = context;
-
         const action = args[0]?.toLowerCase();
 
         if (!action || !['on', 'off'].includes(action)) {
             const currentState = await store.getSetting('global', 'stealthMode');
-            const status = currentState?.enabled ? 'ON 👻' : 'OFF ✅';
-
+            const status = currentState?.enabled ? '👻 ON' : '✅ OFF';
             return await sock.sendMessage(chatId, {
-                text: `👻 *Stealth Mode Status:* ${status}\n\n*Usage:* .stealth <on|off>\n\n*What it does:*\n• Blocks all presence updates (typing, online, last seen)\n• Periodically re-asserts offline status every 2 min\n• Makes the bot completely invisible to contacts\n\n*When enabled:*\n✓ No "typing..." indicator\n✓ No "online" status\n✓ Complete ghost mode`
+                text: `👻 *Stealth Mode:* ${status}\n\n*Usage:* .stealth on / .stealth off\n\n*When ON:*\n• Bot appears permanently offline\n• No typing/online indicators\n• Presence re-asserted every 45 sec\n• Survives reconnects automatically`
             }, { quoted: message });
         }
 
@@ -72,41 +91,35 @@ export default {
         await store.saveSetting('global', 'stealthMode', { enabled });
 
         if (enabled) {
-            // 1. Start the periodic enforcer so it survives reconnects
-            startEnforcer(sock);
-
-            // 2. Immediately go offline — don't wait for the next enforcer tick
-            try {
-                await new Promise(r => setTimeout(r, 300));
-                await sock.sendPresenceUpdate('unavailable');
-            } catch (_) {}
+            _sock = sock;
+            startEnforcer();
+            await assertOffline(sock);
 
             let warnings = '';
             try {
-                const autotypingState = await store.getSetting('global', 'autotyping');
-                const autoreadState   = await store.getSetting('global', 'autoread');
-                if (autotypingState?.enabled || autoreadState?.enabled) {
-                    warnings = '\n\n*⚠️ Note:*\n';
-                    if (autotypingState?.enabled) warnings += '• Autotyping is enabled but will be suppressed\n';
-                    if (autoreadState?.enabled)   warnings += '• Autoread is enabled but will be suppressed\n';
+                const at = await store.getSetting('global', 'autotyping');
+                const ar = await store.getSetting('global', 'autoread');
+                if (at?.enabled || ar?.enabled) {
+                    warnings = '\n\n⚠️ *Note:*\n';
+                    if (at?.enabled) warnings += '• Autotyping enabled but will be suppressed\n';
+                    if (ar?.enabled) warnings += '• Autoread enabled but will be suppressed\n';
                 }
             } catch (_) {}
 
             return await sock.sendMessage(chatId, {
-                text: `👻 Stealth mode *ON*\n\n✓ Bot is now invisible\n✓ No presence updates will leak\n✓ Offline status refreshed every 2 min${warnings}`
+                text: `👻 Stealth mode *ON*\n\n✓ Bot is now invisible\n✓ Offline status enforced every 45 sec\n✓ Survives reconnects automatically${warnings}`
             }, { quoted: message });
 
         } else {
-            // Stop the enforcer first so it can't fight us
             stopEnforcer();
-
+            _sock = sock;
             try {
                 await new Promise(r => setTimeout(r, 300));
                 await sock.sendPresenceUpdate('available');
             } catch (_) {}
 
             return await sock.sendMessage(chatId, {
-                text: `✅ Stealth mode *OFF*\n\n✓ Presence updates re-enabled\n✓ Typing indicators active (if autotyping is on)`
+                text: `✅ Stealth mode *OFF*\n\n✓ Presence updates re-enabled`
             }, { quoted: message });
         }
     }
