@@ -232,7 +232,7 @@ async function startQasimDev(): Promise<any> {
                 creds: state.creds,
                 keys: makeCacheableSignalKeyStore(state.keys, pino({ level: "fatal" }).child({ level: "fatal" })),
             },
-            markOnlineOnConnect: !isGhostActive,
+            markOnlineOnConnect: false,
             generateHighQualityLinkPreview: true,
             syncFullHistory: false,
             getMessage: async (key: any) => {
