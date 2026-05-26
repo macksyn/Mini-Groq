@@ -251,13 +251,22 @@ async function startQasimDev(): Promise<any> {
         const originalReadMessages = QasimDev.readMessages;
         const originalSendReceipt = QasimDev.sendReceipt;
 
-        QasimDev.sendPresenceUpdate = async function (...args: any[]) {
+        QasimDev.sendPresenceUpdate = async function (status: string, chatId: string, ...args: any[]) {
             const ghostMode = await store.getSetting('global', 'stealthMode');
             if (ghostMode && ghostMode.enabled) {
                 printLog('info', '👻 Blocked presence update (stealth mode)');
                 return;
             }
-            return originalSendPresenceUpdate.apply(this, args);
+            
+            // Block global online/offline presence updates ('available', 'unavailable')
+            // This prevents the bot from interfering with your actual WhatsApp presence
+            // Only allow per-chat typing indicators ('composing', 'paused', 'recording')
+            if (status === 'available' || status === 'unavailable') {
+                // Silently block these to prevent status broadcasts
+                return;
+            }
+            
+            return originalSendPresenceUpdate.apply(this, [status, chatId, ...args]);
         };
 
         QasimDev.readMessages = async function (...args: any[]) {
