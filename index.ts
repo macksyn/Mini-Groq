@@ -221,32 +221,30 @@ async function startQasimDev(): Promise<any> {
         };
         const msgRetryCounterCache = new NodeCache();
 
-        const ghostMode    = await store.getSetting('global', 'stealthMode');
-const isGhostActive = !!(ghostMode && ghostMode.enabled);
- 
-const QasimDev = makeWASocket({
-    version,
-    logger: pino({ level: 'silent' }),
-    browser: Browsers.macOS('Chrome'),
-    auth: {
-        creds: state.creds,
-        keys: makeCacheableSignalKeyStore(state.keys, pino({ level: "fatal" }).child({ level: "fatal" })),
-    },
-    markOnlineOnConnect: !isGhostActive,   // ← already existed, now guarded by !!
-    generateHighQualityLinkPreview: true,
-    syncFullHistory: false,
-    getMessage: async (key: any) => {
-        const jid = jidNormalizedUser(key.remoteJid);
-        const msg = await store.loadMessage(jid, key.id);
-        return msg?.message || "";
-    },
-    msgRetryCounterCache,
-    defaultQueryTimeoutMs: 60000,
-    connectTimeoutMs: 60000,
-    keepAliveIntervalMs: 30000,            // ← raised from 10 s → 30 s
-                                           //   (10 s keep-alives were waking WA's
-                                           //    presence state too frequently)
-}) as any;
+        const ghostMode = await store.getSetting('global', 'stealthMode');
+        const isGhostActive = ghostMode && ghostMode.enabled;
+
+        const QasimDev = makeWASocket({
+            version,
+            logger: pino({ level: 'silent' }),
+            browser: Browsers.macOS('Chrome'),
+            auth: {
+                creds: state.creds,
+                keys: makeCacheableSignalKeyStore(state.keys, pino({ level: "fatal" }).child({ level: "fatal" })),
+            },
+            markOnlineOnConnect: !isGhostActive,
+            generateHighQualityLinkPreview: true,
+            syncFullHistory: false,
+            getMessage: async (key: any) => {
+                const jid = jidNormalizedUser(key.remoteJid);
+                const msg = await store.loadMessage(jid, key.id);
+                return msg?.message || "";
+            },
+            msgRetryCounterCache,
+            defaultQueryTimeoutMs: 60000,
+            connectTimeoutMs: 60000,
+            keepAliveIntervalMs: 10000,
+        }) as any;
         QasimDev.store = store;
 
         const originalSendPresenceUpdate = QasimDev.sendPresenceUpdate;
@@ -373,7 +371,12 @@ const QasimDev = makeWASocket({
                     try {
                         const lidMapping = (QasimDev as any)?.signalRepository?.lidMapping;
                         const pnJid: string | null = lidMapping ? await lidMapping.getPNForLID(id) : null;
-                        const phone = pnJid ? pnJid.split('@')[0].split(':')[0] : undefined;
+                        let phone = pnJid ? pnJid.split('@')[0].split(':')[0] : undefined;
+                        // Fall back to store.lidToPhone if signalRepository couldn't resolve
+                        if (!phone) {
+                            const lidNorm = id.split('@')[0].split(':')[0];
+                            phone = (store as any).lidToPhone?.[lidNorm] || undefined;
+                        }
                         await (store as any).saveContact(id, {
                             id,
                             name: contact.notify || contact.name || contact.verifiedName || '',
@@ -526,22 +529,16 @@ const QasimDev = makeWASocket({
                     printLog('error', `Failed to start auto bio: ${e.message}`);
                 }
 
-                const ghostOnOpen = await store.getSetting('global', 'stealthMode');
-if (ghostOnOpen?.enabled) {
-  try { const s = await import('./plugins/stealth.js'); s.syncSock?.(QasimDev); } catch(_) {}
-
-    printLog('info', '👻 STEALTH MODE ACTIVE — asserting offline presence');
-    for (let attempt = 0; attempt < 3; attempt++) {
-        await new Promise(r => setTimeout(r, 1500));
-        try { await QasimDev.sendPresenceUpdate('unavailable'); } catch (_) {}
-    }
-}
+                const ghostMode = await store.getSetting('global', 'stealthMode');
+                if (ghostMode && ghostMode.enabled) {
+                    printLog('info', '👻 STEALTH MODE ACTIVE');
+                }
 
                 printLog('success', 'Connected to => ' + JSON.stringify(QasimDev.user, null, 2));
 
                 try {
                     const botNumber = QasimDev.user.id.split(':')[0] + '@s.whatsapp.net';
-                    const ghostStatus = (ghostOnOpen && ghostOnOpen.enabled) ? '\n👻 Stealth Mode: ACTIVE' : '';
+                    const ghostStatus = (ghostMode && ghostMode.enabled) ? '\n👻 Stealth Mode: ACTIVE' : '';
 
                     await QasimDev.sendMessage(botNumber, {
                         text: `🤖 Bot Connected Successfully!\n\n⏰ Time: ${new Date().toLocaleString()}\n✅ Status: Online and Ready!${ghostStatus}\n\n✅Make sure to join our channel`,
