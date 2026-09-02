@@ -5,7 +5,8 @@ import path from 'path';
 import { writeFile, readFile, unlink, stat, readdir, mkdir } from 'fs/promises';
 import { dataFile } from '../lib/paths.js';
 import store from '../lib/lightweight_store.js';
-import { cleanJid, isOwnerOrSudo } from '../lib/isOwner.js'; // <-- reuse from antilink
+import { cleanJid } from '../lib/isOwner.js';
+import isOwnerOrSudo from '../lib/isOwner.js'; // default export
 
 // ===================== Constants =====================
 const TEMP_DIR = path.join(process.cwd(), 'temp', 'viewonce');
@@ -369,14 +370,13 @@ export default {
         }
 
         // --- Admin subcommands (owner/sudo only) ---
-        // Use cleanJid and isOwnerOrSudo exactly as in antilink.ts
         const senderJid = cleanJid(message.key.participant || message.key.remoteJid);
         const isOwner = await isOwnerOrSudo(senderJid, sock, chatId);
 
         if (!isOwner) {
-            // No response in chat – silently ignore (or optionally send a private error to owner)
+            // Silent ignore – no response in chat
             console.warn(`ViewOnce: Unauthorized admin attempt by ${senderJid}`);
-            return; // completely silent
+            return;
         }
 
         const action = args[0].toLowerCase();
