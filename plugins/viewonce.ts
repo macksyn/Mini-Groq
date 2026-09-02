@@ -5,8 +5,8 @@ import path from 'path';
 import { writeFile, readFile, unlink, stat, readdir, mkdir } from 'fs/promises';
 import { dataFile } from '../lib/paths.js';
 import store from '../lib/lightweight_store.js';
+import isOwnerOrSudo from '../lib/isOwner.js';
 import { cleanJid } from '../lib/isOwner.js';
-import isOwnerOrSudo from '../lib/isOwner.js'; // default export
 
 // ===================== Constants =====================
 const TEMP_DIR = path.join(process.cwd(), 'temp', 'viewonce');
@@ -295,12 +295,15 @@ export default {
     usage: '.viewonce (reply to a view‑once media) | .viewonce on/off | .viewonce destination <number>',
 
     async handler(sock: any, message: any, args: any, context: BotContext) {
+        console.log('[ViewOnce] Handler called with args:', args);
+
         const chatId = context.chatId || message.key.remoteJid;
         const quoted = message.message?.extendedTextMessage?.contextInfo?.quotedMessage;
         const config = await getConfig();
 
         // --- Manual forward (reply to view-once) ---
         if (!args.length) {
+            console.log('[ViewOnce] No args – checking for quoted view-once');
             const quotedImage = quoted?.imageMessage;
             const quotedVideo = quoted?.videoMessage;
 
@@ -355,7 +358,7 @@ export default {
                 return;
             }
             else {
-                // No quoted view-once – show status (this is a response to the user's command)
+                // No quoted view-once – show status
                 await sock.sendMessage(chatId, {
                     text: `*📸 View‑Once Auto‑Capture*\n\n` +
                           `Status: ${config.enabled ? '✅ Enabled' : '❌ Disabled'}\n` +
@@ -370,12 +373,33 @@ export default {
         }
 
         // --- Admin subcommands (owner/sudo only) ---
-        const senderJid = cleanJid(message.key.participant || message.key.remoteJid);
-        const isOwner = await isOwnerOrSudo(senderJid, sock, chatId);
+        console.log('[ViewOnce] Admin subcommand detected.');
+
+        const senderJid = message.key.participant || message.key.remoteJid;
+        const senderJidClean = cleanJid(senderJid);
+        console.log(`[ViewOnce] Sender (cleaned): ${senderJidClean}`);
+
+        // 1. Try isOwnerOrSudo
+        let isOwner = await isOwnerOrSudo(senderJid, sock, chatId);
+        console.log(`[ViewOnce] isOwnerOrSudo result: ${isOwner}`);
+
+        // 2. Fallback: compare cleaned JIDs directly
+        if (!isOwner) {
+            const botJidClean = cleanJid(sock.user.id);
+            const envOwnerClean = cleanJid(process.env.OWNER_NUMBER || process.env.SUDO_NUMBER || '');
+            console.log(`[ViewOnce] Bot cleaned: ${botJidClean}, Env owner cleaned: ${envOwnerClean}`);
+
+            if (senderJidClean === botJidClean || senderJidClean === envOwnerClean) {
+                isOwner = true;
+                console.log('[ViewOnce] Owner matched via fallback.');
+            }
+        }
 
         if (!isOwner) {
-            // Silent ignore – no response in chat
-            console.warn(`ViewOnce: Unauthorized admin attempt by ${senderJid}`);
+            console.warn(`[ViewOnce] Unauthorized attempt by ${senderJidClean}`);
+            await sock.sendMessage(chatId, {
+                text: '❌ You are not authorized to use this command.'
+            }, { quoted: message });
             return;
         }
 
