@@ -1,0 +1,379 @@
+import type { BotContext } from '../types.js';
+import { downloadContentFromMessage } from '@whiskeysockets/baileys';
+import fs from 'fs';
+import path from 'path';
+import { writeFile, readFile, unlink, stat, readdir, mkdir } from 'fs/promises';
+import { dataFile } from '../lib/paths.js';
+import store from '../lib/lightweight_store.js';
+
+// ===================== Constants =====================
+const TEMP_DIR = path.join(process.cwd(), 'temp', 'viewonce');
+const METADATA_FILE = dataFile('viewonce_cache.json');
+const CONFIG_KEY = 'viewonce';
+
+const HAS_DB = !!(process.env.MONGO_URL || process.env.POSTGRES_URL || process.env.MYSQL_URL || process.env.DB_URL);
+const DEFAULT_DESTINATION = process.env.OWNER_NUMBER || (process.env.SUDO_NUMBER || ''); // fallback
+
+// Ensure temp dir exists
+if (!fs.existsSync(TEMP_DIR)) fs.mkdirSync(TEMP_DIR, { recursive: true });
+
+// ===================== In-memory cache =====================
+type ViewOnceEntry = {
+    id: string;
+    sender: string;
+    group?: string;
+    mediaType: 'image' | 'video' | 'sticker' | 'audio';
+    mediaPath: string;
+    caption: string;
+    timestamp: string;
+};
+
+const cache = new Map<string, ViewOnceEntry>();
+let cacheLoaded = false;
+
+// ===================== Config helpers =====================
+async function getConfig() {
+    try {
+        if (HAS_DB) {
+            const cfg = await store.getSetting('global', CONFIG_KEY);
+            return cfg || { enabled: false, destination: DEFAULT_DESTINATION };
+        } else {
+            const cfgPath = dataFile('viewonce.json');
+            if (!fs.existsSync(cfgPath)) return { enabled: false, destination: DEFAULT_DESTINATION };
+            return JSON.parse(await readFile(cfgPath, 'utf-8'));
+        }
+    } catch {
+        return { enabled: false, destination: DEFAULT_DESTINATION };
+    }
+}
+
+async function saveConfig(config: any) {
+    try {
+        if (HAS_DB) {
+            await store.saveSetting('global', CONFIG_KEY, config);
+        } else {
+            await writeFile(dataFile('viewonce.json'), JSON.stringify(config, null, 2));
+        }
+    } catch (e) {
+        console.error('ViewOnce config save error:', e);
+    }
+}
+
+// ===================== Cache persistence =====================
+async function loadCache() {
+    if (cacheLoaded) return;
+    try {
+        if (HAS_DB) {
+            const stored = await store.getSetting('global', CONFIG_KEY + '_cache');
+            if (stored) {
+                const entries = Object.values(stored) as ViewOnceEntry[];
+                entries.forEach(e => cache.set(e.id, e));
+            }
+        } else {
+            if (fs.existsSync(METADATA_FILE)) {
+                const data = await readFile(METADATA_FILE, 'utf-8');
+                const entries = JSON.parse(data) as ViewOnceEntry[];
+                entries.forEach(e => cache.set(e.id, e));
+            }
+        }
+    } catch (e) { console.error('ViewOnce cache load error:', e); }
+    cacheLoaded = true;
+}
+
+let saveTimeout: NodeJS.Timeout | null = null;
+async function saveCache() {
+    if (saveTimeout) clearTimeout(saveTimeout);
+    saveTimeout = setTimeout(async () => {
+        try {
+            const entries = Array.from(cache.values());
+            if (HAS_DB) {
+                await store.saveSetting('global', CONFIG_KEY + '_cache', entries);
+            } else {
+                await writeFile(METADATA_FILE, JSON.stringify(entries, null, 2));
+            }
+        } catch (e) { console.error('ViewOnce cache save error:', e); }
+        saveTimeout = null;
+    }, 1000);
+}
+
+async function addEntry(entry: ViewOnceEntry) {
+    cache.set(entry.id, entry);
+    await saveCache();
+}
+
+function getEntry(id: string) { return cache.get(id); }
+
+// ===================== Download helper =====================
+async function downloadMedia(mediaMessage: any, type: 'image' | 'video' | 'sticker' | 'audio', ext: string): Promise<string> {
+    const stream = await downloadContentFromMessage(mediaMessage, type);
+    const chunks: Buffer[] = [];
+    for await (const chunk of stream) chunks.push(chunk);
+    const buffer = Buffer.concat(chunks);
+    const fileName = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}.${ext}`;
+    const filePath = path.join(TEMP_DIR, fileName);
+    await writeFile(filePath, buffer);
+    return filePath;
+}
+
+// ===================== Main auto-capture handler =====================
+export async function handleViewOnceMessage(sock: any, message: any) {
+    try {
+        const config = await getConfig();
+        if (!config.enabled) return;
+
+        // Detect view-once containers (both V2 and legacy)
+        const container =
+            message.message?.viewOnceMessageV2?.message ||
+            message.message?.viewOnceMessage?.message;
+        if (!container) return;
+
+        const msgKey = message.key;
+        const id = msgKey.id;
+        if (!id) return;
+
+        let mediaType: 'image' | 'video' | 'sticker' | 'audio' | null = null;
+        let mediaPath = '';
+        let caption = '';
+
+        if (container.imageMessage) {
+            mediaType = 'image';
+            caption = container.imageMessage.caption || '';
+            mediaPath = await downloadMedia(container.imageMessage, 'image', 'jpg');
+        } else if (container.videoMessage) {
+            mediaType = 'video';
+            caption = container.videoMessage.caption || '';
+            mediaPath = await downloadMedia(container.videoMessage, 'video', 'mp4');
+        } else if (container.stickerMessage) {
+            mediaType = 'sticker';
+            caption = container.stickerMessage.caption || '';
+            mediaPath = await downloadMedia(container.stickerMessage, 'sticker', 'webp');
+        } else if (container.audioMessage) {
+            mediaType = 'audio';
+            caption = container.audioMessage.caption || '';
+            const mime = container.audioMessage.mimetype || '';
+            const ext = mime.includes('mpeg') ? 'mp3' : (mime.includes('ogg') ? 'ogg' : 'mp3');
+            mediaPath = await downloadMedia(container.audioMessage, 'audio', ext);
+        } else {
+            return; // unknown type
+        }
+
+        const sender = msgKey.participant || msgKey.remoteJid;
+        const group = msgKey.remoteJid.endsWith('@g.us') ? msgKey.remoteJid : undefined;
+
+        const entry: ViewOnceEntry = {
+            id,
+            sender,
+            group,
+            mediaType,
+            mediaPath,
+            caption,
+            timestamp: new Date().toISOString(),
+        };
+        await addEntry(entry);
+
+        // Send to configured destination (owner/sudo)
+        const dest = config.destination || DEFAULT_DESTINATION;
+        if (!dest) {
+            console.warn('ViewOnce: No destination number set.');
+            return;
+        }
+
+        const senderName = sender.split('@')[0];
+        const captionText = `*📸 View‑Once ${mediaType}*\nFrom: @${senderName}\n${caption ? '\n' + caption : ''}`;
+
+        const mediaOptions: any = {
+            caption: captionText,
+            mentions: [sender],
+        };
+
+        switch (mediaType) {
+            case 'image':
+                await sock.sendMessage(dest, { image: { url: mediaPath }, ...mediaOptions });
+                break;
+            case 'video':
+                await sock.sendMessage(dest, { video: { url: mediaPath }, ...mediaOptions });
+                break;
+            case 'sticker':
+                await sock.sendMessage(dest, { sticker: { url: mediaPath }, ...mediaOptions });
+                break;
+            case 'audio':
+                await sock.sendMessage(dest, {
+                    audio: { url: mediaPath },
+                    mimetype: 'audio/mpeg',
+                    ptt: false,
+                });
+                break;
+        }
+        console.log(`✅ View-once ${mediaType} forwarded to ${dest}`);
+
+    } catch (err) {
+        console.error('ViewOnce auto-capture error:', err);
+    }
+}
+
+// ===================== Optional: handle revocation (if antidelete calls it) =====================
+export async function handleViewOnceRevocation(sock: any, revocationMessage: any) {
+    try {
+        const config = await getConfig();
+        if (!config.enabled) return;
+        const protocol = revocationMessage.message?.protocolMessage;
+        if (!protocol) return;
+        const deletedId = protocol.key?.id;
+        if (!deletedId) return;
+        const entry = getEntry(deletedId);
+        if (!entry) return;
+        // Re-send to destination
+        const dest = config.destination || DEFAULT_DESTINATION;
+        if (!dest) return;
+        const senderName = entry.sender.split('@')[0];
+        const caption = `*🔄 View‑Once ${entry.mediaType} (deleted)*\nFrom: @${entry.sender.split('@')[0]}`;
+        const mediaOptions: any = { caption, mentions: [entry.sender] };
+        switch (entry.mediaType) {
+            case 'image': await sock.sendMessage(dest, { image: { url: entry.mediaPath }, ...mediaOptions }); break;
+            case 'video': await sock.sendMessage(dest, { video: { url: entry.mediaPath }, ...mediaOptions }); break;
+            case 'sticker': await sock.sendMessage(dest, { sticker: { url: entry.mediaPath }, ...mediaOptions }); break;
+            case 'audio': await sock.sendMessage(dest, { audio: { url: entry.mediaPath }, mimetype: 'audio/mpeg', ptt: false }); break;
+        }
+    } catch (err) {
+        console.error('ViewOnce revocation error:', err);
+    }
+}
+
+// ===================== Cleanup (daily) =====================
+const CLEANUP_INTERVAL = 24 * 60 * 60 * 1000; // 1 day
+const MAX_AGE = 7 * 24 * 60 * 60 * 1000; // 7 days
+
+async function cleanupOldFiles() {
+    try {
+        const now = Date.now();
+        const files = await readdir(TEMP_DIR);
+        for (const file of files) {
+            const filePath = path.join(TEMP_DIR, file);
+            try {
+                const stats = await stat(filePath);
+                if (now - stats.mtimeMs > MAX_AGE) {
+                    await unlink(filePath);
+                    // Remove from cache
+                    for (const [id, entry] of cache) {
+                        if (entry.mediaPath === filePath) {
+                            cache.delete(id);
+                            break;
+                        }
+                    }
+                }
+            } catch (e) { /* ignore */ }
+        }
+        await saveCache();
+    } catch (e) {
+        console.error('ViewOnce cleanup error:', e);
+    }
+}
+
+// Start cleanup on boot and periodically
+setTimeout(cleanupOldFiles, 5000);
+setInterval(cleanupOldFiles, CLEANUP_INTERVAL);
+
+// ===================== Manual Command (existing functionality) =====================
+export default {
+    command: 'viewonce',
+    aliases: ['viewmedia', 'vv'],
+    category: 'general',
+    description: 'Re-send a view-once image/video (reply to it) or manage auto-capture.',
+    usage: '.viewonce (reply to view-once) | .viewonce on/off | .viewonce destination <number>',
+
+    async handler(sock: any, message: any, args: any, context: BotContext) {
+        const chatId = context.chatId || message.key.remoteJid;
+        const quoted = message.message?.extendedTextMessage?.contextInfo?.quotedMessage;
+
+        // If no args, try to resend the quoted view-once (manual)
+        if (!args.length) {
+            try {
+                const quotedImage = quoted?.imageMessage;
+                const quotedVideo = quoted?.videoMessage;
+
+                if (quotedImage && quotedImage.viewOnce) {
+                    const stream = await downloadContentFromMessage(quotedImage, 'image');
+                    let buffer = Buffer.from([]);
+                    for await (const chunk of stream) buffer = Buffer.concat([buffer, chunk]);
+                    await sock.sendMessage(chatId, {
+                        image: buffer,
+                        fileName: 'media.jpg',
+                        caption: quotedImage.caption || ''
+                    }, { quoted: message });
+                    return;
+                }
+                else if (quotedVideo && quotedVideo.viewOnce) {
+                    const stream = await downloadContentFromMessage(quotedVideo, 'video');
+                    let buffer = Buffer.from([]);
+                    for await (const chunk of stream) buffer = Buffer.concat([buffer, chunk]);
+                    await sock.sendMessage(chatId, {
+                        video: buffer,
+                        fileName: 'media.mp4',
+                        caption: quotedVideo.caption || ''
+                    }, { quoted: message });
+                    return;
+                }
+                else {
+                    // Show status
+                    const config = await getConfig();
+                    await sock.sendMessage(chatId, {
+                        text: `*📸 View‑Once Auto‑Capture*\n\n` +
+                              `Status: ${config.enabled ? '✅ Enabled' : '❌ Disabled'}\n` +
+                              `Destination: ${config.destination || 'Not set'}\n\n` +
+                              `Reply to a view‑once message to manually re‑send it.\n` +
+                              `Commands:\n` +
+                              `• \`.viewonce on/off\` – toggle auto‑capture\n` +
+                              `• \`.viewonce destination <number>\` – set recipient (owner/sudo)`
+                    }, { quoted: message });
+                }
+            } catch (error: any) {
+                console.error('Manual viewonce error:', error);
+                await sock.sendMessage(chatId, {
+                    text: '❌ Failed to retrieve the view‑once media. Please try again later.'
+                }, { quoted: message });
+            }
+            return;
+        }
+
+        // --- Admin commands (owner only) ---
+        const action = args[0].toLowerCase();
+        const config = await getConfig();
+
+        if (action === 'on' || action === 'off') {
+            // Only owner can toggle (or check ownerOnly flag)
+            // We'll rely on the command's ownerOnly: true in the registration, but we'll also check manually.
+            // Since the export already has ownerOnly: true, we can skip extra check, but we'll add a safe guard:
+            // However, the command is marked ownerOnly: true, so only owner can run it.
+            config.enabled = (action === 'on');
+            await saveConfig(config);
+            await sock.sendMessage(chatId, {
+                text: `✅ View‑Once auto‑capture ${config.enabled ? 'enabled' : 'disabled'}.`
+            }, { quoted: message });
+            return;
+        }
+
+        if (action === 'destination') {
+            const newDest = args[1];
+            if (!newDest || !newDest.includes('@')) {
+                await sock.sendMessage(chatId, {
+                    text: '❌ Provide a valid JID (e.g., 1234567890@s.whatsapp.net)'
+                }, { quoted: message });
+                return;
+            }
+            config.destination = newDest;
+            await saveConfig(config);
+            await sock.sendMessage(chatId, {
+                text: `✅ Destination updated to: ${newDest}`
+            }, { quoted: message });
+            return;
+        }
+
+        await sock.sendMessage(chatId, {
+            text: '❌ Invalid subcommand. Use: on/off/destination'
+        }, { quoted: message });
+    },
+    ownerOnly: true, // restricts the config commands
+};
+
+// Load cache on module import
+loadCache();
