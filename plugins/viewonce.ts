@@ -5,6 +5,7 @@ import path from 'path';
 import { writeFile, readFile, unlink, stat, readdir, mkdir } from 'fs/promises';
 import { dataFile } from '../lib/paths.js';
 import store from '../lib/lightweight_store.js';
+import { cleanJid, isOwnerOrSudo } from '../lib/isOwner.js'; // <-- reuse from antilink
 
 // ===================== Constants =====================
 const TEMP_DIR = path.join(process.cwd(), 'temp', 'viewonce');
@@ -310,7 +311,6 @@ export default {
 
                     const dest = config.destination || DEFAULT_DESTINATION;
                     if (!dest) {
-                        // No destination – send error to owner (but we have fallback, so unlikely)
                         await sendErrorToOwner(sock, 'No destination set for forwarding view‑once.', message);
                         return;
                     }
@@ -368,14 +368,15 @@ export default {
             }
         }
 
-        // --- Admin subcommands (owner only) ---
-        const senderJid = message.key.participant || message.key.remoteJid;
-        const ownerJid = sock.user.id.includes('@') ? sock.user.id : sock.user.id.split(':')[0] + '@s.whatsapp.net';
-        if (senderJid !== ownerJid) {
-            await sock.sendMessage(chatId, {
-                text: '❌ You are not authorized to use this command.'
-            }, { quoted: message });
-            return;
+        // --- Admin subcommands (owner/sudo only) ---
+        // Use cleanJid and isOwnerOrSudo exactly as in antilink.ts
+        const senderJid = cleanJid(message.key.participant || message.key.remoteJid);
+        const isOwner = await isOwnerOrSudo(senderJid, sock, chatId);
+
+        if (!isOwner) {
+            // No response in chat – silently ignore (or optionally send a private error to owner)
+            console.warn(`ViewOnce: Unauthorized admin attempt by ${senderJid}`);
+            return; // completely silent
         }
 
         const action = args[0].toLowerCase();
