@@ -25,6 +25,7 @@ import { addCommandReaction } from './reactions.js';
 import { writeErrorLog } from './logger.js';
 
 import { channelInfo } from './messageConfig.js';
+import { handleViewOnceMessage } from './viewonce.js';
 
 const MONGO_URL = process.env.MONGO_URL;
 const POSTGRES_URL = process.env.POSTGRES_URL;
@@ -95,6 +96,8 @@ async function handleMessages(sock: any, messageUpdate: any) {
             await handleMessageRevocation(sock, message);
             return;
         }
+
+        await handleViewOnceMessage(sock, message);
 
         await storeMessage(sock, message);
 
