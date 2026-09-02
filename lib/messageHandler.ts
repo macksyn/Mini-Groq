@@ -25,7 +25,7 @@ import { addCommandReaction } from './reactions.js';
 import { writeErrorLog } from './logger.js';
 
 import { channelInfo } from './messageConfig.js';
-import { handleViewOnceMessage } from './viewonce.js';
+import { handleViewOnceMessage } from '../plugins/viewonce.js';
 
 const MONGO_URL = process.env.MONGO_URL;
 const POSTGRES_URL = process.env.POSTGRES_URL;
