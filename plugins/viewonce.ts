@@ -12,9 +12,8 @@ const METADATA_FILE = dataFile('viewonce_cache.json');
 const CONFIG_KEY = 'viewonce';
 
 const HAS_DB = !!(process.env.MONGO_URL || process.env.POSTGRES_URL || process.env.MYSQL_URL || process.env.DB_URL);
-const DEFAULT_DESTINATION = process.env.OWNER_NUMBER || (process.env.SUDO_NUMBER || ''); // fallback
+const DEFAULT_DESTINATION = process.env.OWNER_NUMBER || (process.env.SUDO_NUMBER || '');
 
-// Ensure temp dir exists
 if (!fs.existsSync(TEMP_DIR)) fs.mkdirSync(TEMP_DIR, { recursive: true });
 
 // ===================== In-memory cache =====================
@@ -121,7 +120,6 @@ export async function handleViewOnceMessage(sock: any, message: any) {
         const config = await getConfig();
         if (!config.enabled) return;
 
-        // Detect view-once containers (both V2 and legacy)
         const container =
             message.message?.viewOnceMessageV2?.message ||
             message.message?.viewOnceMessage?.message;
@@ -154,7 +152,7 @@ export async function handleViewOnceMessage(sock: any, message: any) {
             const ext = mime.includes('mpeg') ? 'mp3' : (mime.includes('ogg') ? 'ogg' : 'mp3');
             mediaPath = await downloadMedia(container.audioMessage, 'audio', ext);
         } else {
-            return; // unknown type
+            return;
         }
 
         const sender = msgKey.participant || msgKey.remoteJid;
@@ -171,7 +169,6 @@ export async function handleViewOnceMessage(sock: any, message: any) {
         };
         await addEntry(entry);
 
-        // Send to configured destination (owner/sudo)
         const dest = config.destination || DEFAULT_DESTINATION;
         if (!dest) {
             console.warn('ViewOnce: No destination number set.');
@@ -211,7 +208,7 @@ export async function handleViewOnceMessage(sock: any, message: any) {
     }
 }
 
-// ===================== Optional: handle revocation (if antidelete calls it) =====================
+// ===================== Optional: handle revocation =====================
 export async function handleViewOnceRevocation(sock: any, revocationMessage: any) {
     try {
         const config = await getConfig();
@@ -222,10 +219,9 @@ export async function handleViewOnceRevocation(sock: any, revocationMessage: any
         if (!deletedId) return;
         const entry = getEntry(deletedId);
         if (!entry) return;
-        // Re-send to destination
+
         const dest = config.destination || DEFAULT_DESTINATION;
         if (!dest) return;
-        const senderName = entry.sender.split('@')[0];
         const caption = `*🔄 View‑Once ${entry.mediaType} (deleted)*\nFrom: @${entry.sender.split('@')[0]}`;
         const mediaOptions: any = { caption, mentions: [entry.sender] };
         switch (entry.mediaType) {
@@ -239,9 +235,9 @@ export async function handleViewOnceRevocation(sock: any, revocationMessage: any
     }
 }
 
-// ===================== Cleanup (daily) =====================
-const CLEANUP_INTERVAL = 24 * 60 * 60 * 1000; // 1 day
-const MAX_AGE = 7 * 24 * 60 * 60 * 1000; // 7 days
+// ===================== Cleanup =====================
+const CLEANUP_INTERVAL = 24 * 60 * 60 * 1000;
+const MAX_AGE = 7 * 24 * 60 * 60 * 1000;
 
 async function cleanupOldFiles() {
     try {
@@ -253,7 +249,6 @@ async function cleanupOldFiles() {
                 const stats = await stat(filePath);
                 if (now - stats.mtimeMs > MAX_AGE) {
                     await unlink(filePath);
-                    // Remove from cache
                     for (const [id, entry] of cache) {
                         if (entry.mediaPath === filePath) {
                             cache.delete(id);
@@ -269,81 +264,123 @@ async function cleanupOldFiles() {
     }
 }
 
-// Start cleanup on boot and periodically
 setTimeout(cleanupOldFiles, 5000);
 setInterval(cleanupOldFiles, CLEANUP_INTERVAL);
 
-// ===================== Manual Command (existing functionality) =====================
+// ===================== Helper to send error to owner =====================
+async function sendErrorToOwner(sock: any, errorMessage: string, commandMessage: any) {
+    const dest = (await getConfig()).destination || DEFAULT_DESTINATION;
+    if (!dest) {
+        console.error('ViewOnce error (no destination):', errorMessage);
+        return;
+    }
+    try {
+        const sender = commandMessage.key.participant || commandMessage.key.remoteJid;
+        await sock.sendMessage(dest, {
+            text: `⚠️ *ViewOnce Manual Forward Error*\n\n${errorMessage}\n\nCommand from: ${sender}`
+        });
+    } catch (e) {
+        console.error('Failed to send error to owner:', e);
+    }
+}
+
+// ===================== Command =====================
 export default {
     command: 'viewonce',
     aliases: ['viewmedia', 'vv'],
     category: 'general',
-    description: 'Re-send a view-once image/video (reply to it) or manage auto-capture.',
-    usage: '.viewonce (reply to view-once) | .viewonce on/off | .viewonce destination <number>',
+    description: 'Forward a view‑once media to the owner (reply to it) or manage auto‑capture.',
+    usage: '.viewonce (reply to a view‑once media) | .viewonce on/off | .viewonce destination <number>',
 
     async handler(sock: any, message: any, args: any, context: BotContext) {
         const chatId = context.chatId || message.key.remoteJid;
         const quoted = message.message?.extendedTextMessage?.contextInfo?.quotedMessage;
+        const config = await getConfig();
 
-        // If no args, try to resend the quoted view-once (manual)
+        // --- Manual forward (reply to view-once) ---
         if (!args.length) {
-            try {
-                const quotedImage = quoted?.imageMessage;
-                const quotedVideo = quoted?.videoMessage;
+            const quotedImage = quoted?.imageMessage;
+            const quotedVideo = quoted?.videoMessage;
 
-                if (quotedImage && quotedImage.viewOnce) {
+            if (quotedImage && quotedImage.viewOnce) {
+                try {
                     const stream = await downloadContentFromMessage(quotedImage, 'image');
                     let buffer = Buffer.from([]);
                     for await (const chunk of stream) buffer = Buffer.concat([buffer, chunk]);
-                    await sock.sendMessage(chatId, {
+
+                    const dest = config.destination || DEFAULT_DESTINATION;
+                    if (!dest) {
+                        // No destination – send error to owner (but we have fallback, so unlikely)
+                        await sendErrorToOwner(sock, 'No destination set for forwarding view‑once.', message);
+                        return;
+                    }
+                    const sender = message.key.participant || message.key.remoteJid;
+                    const caption = `*📸 View‑Once Image (manual forward)*\nFrom: @${sender.split('@')[0]}`;
+                    await sock.sendMessage(dest, {
                         image: buffer,
-                        fileName: 'media.jpg',
-                        caption: quotedImage.caption || ''
-                    }, { quoted: message });
-                    return;
+                        caption,
+                        mentions: [sender]
+                    });
+                    // ✅ No confirmation sent to chat
+                } catch (error: any) {
+                    console.error('Manual viewonce image error:', error);
+                    await sendErrorToOwner(sock, `Image download/send failed: ${error.message || 'Unknown error'}`, message);
                 }
-                else if (quotedVideo && quotedVideo.viewOnce) {
+                return;
+            }
+            else if (quotedVideo && quotedVideo.viewOnce) {
+                try {
                     const stream = await downloadContentFromMessage(quotedVideo, 'video');
                     let buffer = Buffer.from([]);
                     for await (const chunk of stream) buffer = Buffer.concat([buffer, chunk]);
-                    await sock.sendMessage(chatId, {
+
+                    const dest = config.destination || DEFAULT_DESTINATION;
+                    if (!dest) {
+                        await sendErrorToOwner(sock, 'No destination set for forwarding view‑once.', message);
+                        return;
+                    }
+                    const sender = message.key.participant || message.key.remoteJid;
+                    const caption = `*📸 View‑Once Video (manual forward)*\nFrom: @${sender.split('@')[0]}`;
+                    await sock.sendMessage(dest, {
                         video: buffer,
-                        fileName: 'media.mp4',
-                        caption: quotedVideo.caption || ''
-                    }, { quoted: message });
-                    return;
+                        caption,
+                        mentions: [sender]
+                    });
+                    // ✅ No confirmation sent to chat
+                } catch (error: any) {
+                    console.error('Manual viewonce video error:', error);
+                    await sendErrorToOwner(sock, `Video download/send failed: ${error.message || 'Unknown error'}`, message);
                 }
-                else {
-                    // Show status
-                    const config = await getConfig();
-                    await sock.sendMessage(chatId, {
-                        text: `*📸 View‑Once Auto‑Capture*\n\n` +
-                              `Status: ${config.enabled ? '✅ Enabled' : '❌ Disabled'}\n` +
-                              `Destination: ${config.destination || 'Not set'}\n\n` +
-                              `Reply to a view‑once message to manually re‑send it.\n` +
-                              `Commands:\n` +
-                              `• \`.viewonce on/off\` – toggle auto‑capture\n` +
-                              `• \`.viewonce destination <number>\` – set recipient (owner/sudo)`
-                    }, { quoted: message });
-                }
-            } catch (error: any) {
-                console.error('Manual viewonce error:', error);
-                await sock.sendMessage(chatId, {
-                    text: '❌ Failed to retrieve the view‑once media. Please try again later.'
-                }, { quoted: message });
+                return;
             }
+            else {
+                // No quoted view-once – show status (this is a response to the user's command)
+                await sock.sendMessage(chatId, {
+                    text: `*📸 View‑Once Auto‑Capture*\n\n` +
+                          `Status: ${config.enabled ? '✅ Enabled' : '❌ Disabled'}\n` +
+                          `Destination: ${config.destination || 'Not set'}\n\n` +
+                          `Reply to a view‑once message to manually forward it to the owner.\n` +
+                          `Commands (owner only):\n` +
+                          `• \`.viewonce on/off\` – toggle auto‑capture\n` +
+                          `• \`.viewonce destination <number>\` – set recipient`
+                }, { quoted: message });
+                return;
+            }
+        }
+
+        // --- Admin subcommands (owner only) ---
+        const senderJid = message.key.participant || message.key.remoteJid;
+        const ownerJid = sock.user.id.includes('@') ? sock.user.id : sock.user.id.split(':')[0] + '@s.whatsapp.net';
+        if (senderJid !== ownerJid) {
+            await sock.sendMessage(chatId, {
+                text: '❌ You are not authorized to use this command.'
+            }, { quoted: message });
             return;
         }
 
-        // --- Admin commands (owner only) ---
         const action = args[0].toLowerCase();
-        const config = await getConfig();
 
         if (action === 'on' || action === 'off') {
-            // Only owner can toggle (or check ownerOnly flag)
-            // We'll rely on the command's ownerOnly: true in the registration, but we'll also check manually.
-            // Since the export already has ownerOnly: true, we can skip extra check, but we'll add a safe guard:
-            // However, the command is marked ownerOnly: true, so only owner can run it.
             config.enabled = (action === 'on');
             await saveConfig(config);
             await sock.sendMessage(chatId, {
@@ -372,8 +409,6 @@ export default {
             text: '❌ Invalid subcommand. Use: on/off/destination'
         }, { quoted: message });
     },
-    ownerOnly: true, // restricts the config commands
 };
 
-// Load cache on module import
 loadCache();
