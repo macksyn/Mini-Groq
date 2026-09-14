@@ -374,33 +374,21 @@ export default {
         // --- Admin subcommands (owner/sudo only) ---
         console.log('[ViewOnce] Admin subcommand detected.');
 
-        const senderJid = message.key.participant || message.key.remoteJid;
-        console.log('[ViewOnce] Sender:', senderJid
-      );
+        const senderJid =
+    message.key.participant ||
+    message.key.remoteJid ||
+    '';
 
-        const isOwner =
-    await isOwnerOrSudo(
-        senderJid,
-        sock,
-        chatId
-    );
+const isOwner = await isOwnerOrSudo(
+    senderJid,
+    sock,
+    chatId
+);
 
 if (!isOwner) {
-
-    console.warn(
-        `[ViewOnce] Unauthorized attempt: ${senderJid}`
-    );
-
-    await sock.sendMessage(
-        chatId,
-        {
-            text:
-                '❌ You are not authorized to use this command.'
-        },
-        {
-            quoted: message
-        }
-    );
+    await sock.sendMessage(chatId, {
+        text: '❌ This command is restricted to the bot owner.'
+    }, { quoted: message });
 
     return;
 }
