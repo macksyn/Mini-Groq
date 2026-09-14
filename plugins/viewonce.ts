@@ -375,7 +375,8 @@ export default {
         console.log('[ViewOnce] Admin subcommand detected.');
 
         const senderJid = message.key.participant || message.key.remoteJid;
-        console.log(`[ViewOnce] Sender (cleaned): ${senderJidClean}`);
+        console.log('[ViewOnce] Sender:' senderJid
+      );
 
         const isOwner =
     await isOwnerOrSudo(
