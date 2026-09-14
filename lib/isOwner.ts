@@ -2,96 +2,200 @@ import config from '../config.js';
 import { isSudo } from './index.js';
 
 /**
- * Normalize a JID without destroying whether it is a LID or PN.
+ * Normalize a WhatsApp JID without destroying the distinction
+ * between a phone-number JID (@s.whatsapp.net) and a LID (@lid).
  *
  * Examples:
- *
- * 2348089782988@s.whatsapp.net
- * 2348089782988:12@s.whatsapp.net
- * 123456789@lid
- *
- * become:
- *
- * 2348089782988@s.whatsapp.net
- * 2348089782988@s.whatsapp.net
- * 123456789@lid
+ *   2348089782988:0@s.whatsapp.net -> 2348089782988@s.whatsapp.net
+ *   180230366957605@lid            -> 180230366957605@lid
  */
 function normalizeJid(jid: string | undefined | null): string {
     if (!jid) return '';
 
-    return jid
-        .trim()
+    return String(jid)
         .replace(/^whatsapp:/i, '')
-        .replace(/:\d+(?=@)/, '');
+        .split(':')[0]
+        .trim()
+        .toLowerCase();
 }
 
 /**
- * Extract phone number from a PN JID.
+ * Return the phone number portion of a normal WhatsApp PN JID.
  *
  * IMPORTANT:
- * A LID is NOT a phone number, so we return ''
- * for @lid.
+ * We intentionally return '' for @lid.
+ * A LID is NOT a phone number and must not be compared directly
+ * with config.ownerNumber.
  */
 function cleanJid(jid: string | undefined | null): string {
     const normalized = normalizeJid(jid);
 
-    if (!normalized || normalized.endsWith('@lid')) {
+    if (!normalized) return '';
+
+    if (normalized.endsWith('@lid')) {
         return '';
     }
 
     return normalized
-        .split('@')[0]
-        .replace(/\D/g, '');
+        .replace('@s.whatsapp.net', '')
+        .replace('@c.us', '')
+        .replace('@g.us', '');
 }
 
 /**
- * Compare two phone identities.
+ * Compare two normal phone-number identities.
  */
 function samePhoneNumber(
-    a: string | undefined | null,
-    b: string | undefined | null
+    jid1: string | undefined | null,
+    jid2: string | undefined | null
 ): boolean {
-    const aNumber = cleanJid(a);
-    const bNumber = cleanJid(b);
+    const a = cleanJid(jid1);
+    const b = cleanJid(jid2);
 
-    return !!aNumber && !!bNumber && aNumber === bNumber;
+    return !!a && !!b && a === b;
 }
 
 /**
- * Check whether a JID is the configured owner.
+ * Check whether a JID represents the bot's own identity.
+ *
+ * This is especially useful because WhatsApp groups can identify
+ * the bot/owner using a @lid instead of the normal phone JID.
  */
-function isConfiguredOwner(jid: string): boolean {
-    return samePhoneNumber(jid, config.ownerNumber);
-}
+function isBotIdentity(
+    senderId: string,
+    sock: any
+): boolean {
+    if (!sock?.user) return false;
 
-/**
- * Find a group participant from either their PN or LID.
- */
-function findParticipant(
-    participants: any[],
-    senderId: string
-) {
     const sender = normalizeJid(senderId);
 
-    return participants.find((participant: any) => {
+    if (!sender) return false;
 
+    // Bot's normal phone-number identity
+    if (sock.user.id) {
+        const botId = normalizeJid(sock.user.id);
+
+        if (sender === botId) {
+            console.log('[isOwner] ✅ Bot identity match');
+            return true;
+        }
+
+        // Also compare phone numbers in case one contains a device suffix.
+        if (samePhoneNumber(senderId, sock.user.id)) {
+            console.log('[isOwner] ✅ Bot phone identity match');
+            return true;
+        }
+    }
+
+    // Bot's LID identity.
+    //
+    // This is the important part for group messages where WhatsApp
+    // sends the owner as something like:
+    // 180230366957605@lid
+    if (sock.user.lid) {
+        const botLid = normalizeJid(sock.user.lid);
+
+        if (sender === botLid) {
+            console.log('[isOwner] ✅ Bot LID identity match');
+            return true;
+        }
+    }
+
+    return false;
+}
+
+/**
+ * Try to determine whether a group participant corresponds
+ * to the configured owner or a sudo user.
+ */
+async function checkGroupParticipant(
+    senderId: string,
+    chatId: string,
+    sock: any,
+    ownerNumberClean: string
+): Promise<boolean> {
+    if (!sock || !chatId || !chatId.endsWith('@g.us')) {
+        return false;
+    }
+
+    try {
+        const metadata = await sock.groupMetadata(chatId);
+        const participants = metadata?.participants || [];
+
+        console.log('[isOwner] Participants:', participants.length);
+
+        const senderNormalized = normalizeJid(senderId);
+
+        const participant = participants.find((p: any) => {
+            const identities = [
+                p?.id,
+                p?.lid,
+                p?.jid,
+                p?.phoneNumber,
+                p?.phoneNumberJid
+            ]
+                .filter(Boolean)
+                .map((id: string) => normalizeJid(id));
+
+            return identities.includes(senderNormalized);
+        });
+
+        if (!participant) {
+            console.log('[isOwner] ❌ Sender not found in group participants');
+            return false;
+        }
+
+        console.log('[isOwner] Resolved participant:', {
+            id: participant.id,
+            lid: participant.lid,
+            jid: participant.jid,
+            phoneNumber: participant.phoneNumber,
+            phoneNumberJid: participant.phoneNumberJid
+        });
+
+        // Check every identity Baileys gives us for this participant.
         const identities = [
             participant.id,
             participant.lid,
             participant.jid,
             participant.phoneNumber,
-            participant.phoneNumberJid,
+            participant.phoneNumberJid
         ].filter(Boolean);
 
-        return identities.some(
-            (identity: string) =>
-                normalizeJid(identity) === sender
+        for (const identity of identities) {
+            // Owner phone number
+            if (samePhoneNumber(identity, ownerNumberClean)) {
+                console.log('[isOwner] ✅ Owner matched through group participant');
+                return true;
+            }
+
+            // Sudo
+            if (await isSudo(identity)) {
+                console.log('[isOwner] ✅ Sudo matched through group participant');
+                return true;
+            }
+        }
+
+    } catch (error: any) {
+        console.error(
+            '[isOwner] Group participant lookup error:',
+            error?.message || error
         );
-    });
+    }
+
+    return false;
 }
 
 /**
- * Check whether a user is owner or sudo.
+ * Check if user is owner or sudo.
+ *
+ * Owner detection order:
+ *
+ * 1. Configured owner phone number
+ * 2. Bot's own WhatsApp identity
+ * 3. Bot's own LID
+ * 4. Direct sudo
+ * 5. Group participant identity resolution
  */
 async function isOwnerOrSudo(
     senderId: string,
@@ -99,204 +203,132 @@ async function isOwnerOrSudo(
     chatId: string | null = null
 ): Promise<boolean> {
 
-    if (!senderId) {
+    try {
+        const ownerNumberClean = cleanJid(config.ownerNumber);
+        const senderIdClean = cleanJid(senderId);
+
+        console.log('[isOwner] ===========================');
+        console.log('[isOwner] Sender:', senderId);
+        console.log('[isOwner] Config owner:', ownerNumberClean);
+        console.log('[isOwner] Chat:', chatId);
+
+        /**
+         * 1. Direct configured owner match
+         *
+         * Works for private chats where sender is:
+         * 2348089782988@s.whatsapp.net
+         */
+        if (
+            senderIdClean &&
+            ownerNumberClean &&
+            senderIdClean === ownerNumberClean
+        ) {
+            console.log('[isOwner] ✅ Direct owner match');
+            return true;
+        }
+
+        /**
+         * 2 + 3. Bot identity / bot LID
+         *
+         * This is what handles the important group case where
+         * WhatsApp sends the owner as @lid.
+         */
+        if (isBotIdentity(senderId, sock)) {
+            return true;
+        }
+
+        /**
+         * 4. Direct sudo check
+         */
+        if (await isSudo(senderId)) {
+            console.log('[isOwner] ✅ Direct sudo match');
+            return true;
+        }
+
+        /**
+         * 5. Group participant resolution
+         */
+        if (
+            sock &&
+            chatId &&
+            chatId.endsWith('@g.us')
+        ) {
+            const groupMatch = await checkGroupParticipant(
+                senderId,
+                chatId,
+                sock,
+                ownerNumberClean
+            );
+
+            if (groupMatch) {
+                return true;
+            }
+        }
+
+        console.log('[isOwner] ❌ Not owner');
+
+        return false;
+
+    } catch (error: any) {
+        console.error(
+            '[isOwner] Error:',
+            error?.message || error
+        );
+
         return false;
     }
-
-    const sender = normalizeJid(senderId);
-
-    console.log('[isOwner] ===========================');
-    console.log('[isOwner] Sender:', sender);
-    console.log('[isOwner] Config owner:', config.ownerNumber);
-    console.log('[isOwner] Chat:', chatId);
-
-    // =========================================================
-    // 1. Direct owner check
-    // =========================================================
-
-    if (isConfiguredOwner(sender)) {
-        console.log('[isOwner] ✅ Direct owner match');
-        return true;
-    }
-
-    // =========================================================
-    // 2. Sudo check
-    // =========================================================
-
-    try {
-        if (await isSudo(sender)) {
-            console.log('[isOwner] ✅ Sudo match');
-            return true;
-        }
-    } catch (error) {
-        console.error('[isOwner] Sudo check failed:', error);
-    }
-
-    // =========================================================
-    // 3. Resolve LID through group metadata
-    // =========================================================
-
-    if (
-        sock &&
-        chatId &&
-        chatId.endsWith('@g.us')
-    ) {
-
-        try {
-
-            const metadata =
-                await sock.groupMetadata(chatId);
-
-            const participants =
-                metadata?.participants || [];
-
-            console.log(
-                `[isOwner] Participants: ${participants.length}`
-            );
-
-            const participant =
-                findParticipant(
-                    participants,
-                    sender
-                );
-
-            if (participant) {
-
-                console.log(
-                    '[isOwner] Resolved participant:',
-                    {
-                        id: participant.id,
-                        lid: participant.lid,
-                        jid: participant.jid,
-                    }
-                );
-
-                // ---------------------------------------------
-                // Check the participant's real PN
-                // ---------------------------------------------
-
-                if (
-                    participant.id &&
-                    isConfiguredOwner(
-                        participant.id
-                    )
-                ) {
-                    console.log(
-                        '[isOwner] ✅ LID resolved to OWNER'
-                    );
-
-                    return true;
-                }
-
-                // ---------------------------------------------
-                // Check all participant identities for sudo
-                // ---------------------------------------------
-
-                const identities = [
-                    participant.id,
-                    participant.lid,
-                    participant.jid,
-                ].filter(Boolean);
-
-                for (const identity of identities) {
-
-                    if (
-                        await isSudo(identity)
-                    ) {
-                        console.log(
-                            '[isOwner] ✅ LID resolved to SUDO'
-                        );
-
-                        return true;
-                    }
-                }
-
-            } else {
-
-                console.log(
-                    '[isOwner] ⚠️ Participant not found'
-                );
-            }
-
-        } catch (error: any) {
-
-            console.error(
-                '[isOwner] Group metadata error:',
-                error?.message || error
-            );
-        }
-    }
-
-    // =========================================================
-    // 4. Check bot's own identity
-    // =========================================================
-
-    if (sock?.user?.id) {
-
-        if (
-            samePhoneNumber(
-                sender,
-                sock.user.id
-            )
-        ) {
-            console.log(
-                '[isOwner] ✅ Matches bot identity'
-            );
-
-            return true;
-        }
-    }
-
-    console.log('[isOwner] ❌ Not owner');
-
-    return false;
 }
 
 /**
- * Owner ONLY check.
+ * Check if user is ONLY the configured owner.
+ *
+ * This intentionally does NOT treat sudo users as owner.
  */
-function isOwnerOnly(
-    senderId: string
-): boolean {
+function isOwnerOnly(senderId: string): boolean {
+    const ownerNumberClean = cleanJid(config.ownerNumber);
+    const senderIdClean = cleanJid(senderId);
 
-    return isConfiguredOwner(senderId);
+    return !!(
+        ownerNumberClean &&
+        senderIdClean &&
+        ownerNumberClean === senderIdClean
+    );
 }
 
 /**
- * Return a clean phone number for display.
+ * Helper for commands that need a clean phone number.
+ *
+ * Example:
+ *   getCleanName('2348089782988@s.whatsapp.net', sock)
+ *   -> '2348089782988'
  */
 async function getCleanName(
     jid: string,
     sock: any
-) {
+): Promise<string> {
+    if (!jid) return 'Unknown';
 
-    if (!jid) {
-        return 'Unknown';
-    }
+    const cleanNumber = cleanJid(jid);
 
-    const cleanNumber =
-        cleanJid(jid);
-
+    // LIDs don't contain a phone number.
     if (!cleanNumber) {
-        return normalizeJid(jid);
+        return normalizeJid(jid).replace('@lid', '');
     }
 
     try {
-
         if (sock) {
-
-            const contact =
-                await sock.onWhatsApp(jid);
+            const contact = await sock.onWhatsApp(jid);
 
             if (
-                contact?.[0]?.exists
+                contact &&
+                contact[0] &&
+                contact[0].exists
             ) {
                 return cleanNumber;
             }
         }
-
     } catch {
-        // Ignore
+        // Ignore lookup errors and return cleaned value.
     }
 
     return cleanNumber;
@@ -307,6 +339,7 @@ export default isOwnerOrSudo;
 export {
     isOwnerOnly,
     cleanJid,
-    getCleanName,
     normalizeJid,
+    samePhoneNumber,
+    getCleanName
 };
