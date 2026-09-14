@@ -6,7 +6,6 @@ import { writeFile, readFile, unlink, stat, readdir, mkdir } from 'fs/promises';
 import { dataFile } from '../lib/paths.js';
 import store from '../lib/lightweight_store.js';
 import isOwnerOrSudo from '../lib/isOwner.js';
-import { cleanJid } from '../lib/isOwner.js';
 
 // ===================== Constants =====================
 const TEMP_DIR = path.join(process.cwd(), 'temp', 'viewonce');
