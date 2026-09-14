@@ -200,12 +200,35 @@ async function resetWarningCount(groupId: string, userId: string) {
     }
 }
 
+function normalizeSudoJid(jid: string): string {
+    if (!jid) return '';
+
+    return jid
+        .trim()
+        .replace(/^whatsapp:/i, '')
+        .replace(/:\d+(?=@)/, '');
+}
+
 async function isSudo(userId: string) {
     try {
         const data = await loadUserGroupData();
-        return data.sudo && data.sudo.includes(userId);
-    } catch(error: any) {
-        console.error('Error checking sudo:', error);
+
+        if (!Array.isArray(data.sudo)) {
+            return false;
+        }
+
+        const target = normalizeSudoJid(userId);
+
+        return data.sudo.some((sudoId: string) => {
+            return normalizeSudoJid(sudoId) === target;
+        });
+
+    } catch (error: any) {
+        console.error(
+            'Error checking sudo:',
+            error
+        );
+
         return false;
     }
 }
