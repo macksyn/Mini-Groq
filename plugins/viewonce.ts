@@ -376,32 +376,34 @@ export default {
         console.log('[ViewOnce] Admin subcommand detected.');
 
         const senderJid = message.key.participant || message.key.remoteJid;
-        const senderJidClean = cleanJid(senderJid);
         console.log(`[ViewOnce] Sender (cleaned): ${senderJidClean}`);
 
-        // 1. Try isOwnerOrSudo
-        let isOwner = await isOwnerOrSudo(senderJid, sock, chatId);
-        console.log(`[ViewOnce] isOwnerOrSudo result: ${isOwner}`);
+        const isOwner =
+    await isOwnerOrSudo(
+        senderJid,
+        sock,
+        chatId
+    );
 
-        // 2. Fallback: compare cleaned JIDs directly
-        if (!isOwner) {
-            const botJidClean = cleanJid(sock.user.id);
-            const envOwnerClean = cleanJid(process.env.OWNER_NUMBER || process.env.SUDO_NUMBER || '');
-            console.log(`[ViewOnce] Bot cleaned: ${botJidClean}, Env owner cleaned: ${envOwnerClean}`);
+if (!isOwner) {
 
-            if (senderJidClean === botJidClean || senderJidClean === envOwnerClean) {
-                isOwner = true;
-                console.log('[ViewOnce] Owner matched via fallback.');
-            }
+    console.warn(
+        `[ViewOnce] Unauthorized attempt: ${senderJid}`
+    );
+
+    await sock.sendMessage(
+        chatId,
+        {
+            text:
+                '❌ You are not authorized to use this command.'
+        },
+        {
+            quoted: message
         }
+    );
 
-        if (!isOwner) {
-            console.warn(`[ViewOnce] Unauthorized attempt by ${senderJidClean}`);
-            await sock.sendMessage(chatId, {
-                text: '❌ You are not authorized to use this command.'
-            }, { quoted: message });
-            return;
-        }
+    return;
+}
 
         const action = args[0].toLowerCase();
 
