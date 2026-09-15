@@ -5,7 +5,6 @@ import path from 'path';
 import { writeFile, readFile, unlink, stat, readdir, mkdir } from 'fs/promises';
 import { dataFile } from '../lib/paths.js';
 import store from '../lib/lightweight_store.js';
-import isOwnerOrSudo from '../lib/isOwner.js';
 
 // ===================== Constants =====================
 const TEMP_DIR = path.join(process.cwd(), 'temp', 'viewonce');
@@ -15,6 +14,7 @@ const CONFIG_KEY = 'viewonce';
 const HAS_DB = !!(process.env.MONGO_URL || process.env.POSTGRES_URL || process.env.MYSQL_URL || process.env.DB_URL);
 const DEFAULT_DESTINATION = process.env.OWNER_NUMBER || (process.env.SUDO_NUMBER || '');
 
+// Ensure temp dir exists
 if (!fs.existsSync(TEMP_DIR)) fs.mkdirSync(TEMP_DIR, { recursive: true });
 
 // ===================== In-memory cache =====================
@@ -268,23 +268,6 @@ async function cleanupOldFiles() {
 setTimeout(cleanupOldFiles, 5000);
 setInterval(cleanupOldFiles, CLEANUP_INTERVAL);
 
-// ===================== Helper to send error to owner =====================
-async function sendErrorToOwner(sock: any, errorMessage: string, commandMessage: any) {
-    const dest = (await getConfig()).destination || DEFAULT_DESTINATION;
-    if (!dest) {
-        console.error('ViewOnce error (no destination):', errorMessage);
-        return;
-    }
-    try {
-        const sender = commandMessage.key.participant || commandMessage.key.remoteJid;
-        await sock.sendMessage(dest, {
-            text: `⚠️ *ViewOnce Manual Forward Error*\n\n${errorMessage}\n\nCommand from: ${sender}`
-        });
-    } catch (e) {
-        console.error('Failed to send error to owner:', e);
-    }
-}
-
 // ===================== Command =====================
 export default {
     command: 'viewonce',
@@ -294,15 +277,12 @@ export default {
     usage: '.viewonce (reply to a view‑once media) | .viewonce on/off | .viewonce destination <number>',
 
     async handler(sock: any, message: any, args: any, context: BotContext) {
-        console.log('[ViewOnce] Handler called with args:', args);
-
         const chatId = context.chatId || message.key.remoteJid;
         const quoted = message.message?.extendedTextMessage?.contextInfo?.quotedMessage;
         const config = await getConfig();
 
         // --- Manual forward (reply to view-once) ---
         if (!args.length) {
-            console.log('[ViewOnce] No args – checking for quoted view-once');
             const quotedImage = quoted?.imageMessage;
             const quotedVideo = quoted?.videoMessage;
 
@@ -314,7 +294,9 @@ export default {
 
                     const dest = config.destination || DEFAULT_DESTINATION;
                     if (!dest) {
-                        await sendErrorToOwner(sock, 'No destination set for forwarding view‑once.', message);
+                        await sock.sendMessage(chatId, {
+                            text: '❌ No destination set. Please set a destination with `.viewonce destination <number>`'
+                        }, { quoted: message });
                         return;
                     }
                     const sender = message.key.participant || message.key.remoteJid;
@@ -324,10 +306,12 @@ export default {
                         caption,
                         mentions: [sender]
                     });
-                    // ✅ No confirmation sent to chat
-                } catch (error: any) {
+                    // ✅ No confirmation sent to chat – silent forward
+                } catch (error) {
                     console.error('Manual viewonce image error:', error);
-                    await sendErrorToOwner(sock, `Image download/send failed: ${error.message || 'Unknown error'}`, message);
+                    await sock.sendMessage(chatId, {
+                        text: '❌ Failed to forward the view‑once media.'
+                    }, { quoted: message });
                 }
                 return;
             }
@@ -339,7 +323,9 @@ export default {
 
                     const dest = config.destination || DEFAULT_DESTINATION;
                     if (!dest) {
-                        await sendErrorToOwner(sock, 'No destination set for forwarding view‑once.', message);
+                        await sock.sendMessage(chatId, {
+                            text: '❌ No destination set. Please set a destination with `.viewonce destination <number>`'
+                        }, { quoted: message });
                         return;
                     }
                     const sender = message.key.participant || message.key.remoteJid;
@@ -350,14 +336,16 @@ export default {
                         mentions: [sender]
                     });
                     // ✅ No confirmation sent to chat
-                } catch (error: any) {
+                } catch (error) {
                     console.error('Manual viewonce video error:', error);
-                    await sendErrorToOwner(sock, `Video download/send failed: ${error.message || 'Unknown error'}`, message);
+                    await sock.sendMessage(chatId, {
+                        text: '❌ Failed to forward the view‑once media.'
+                    }, { quoted: message });
                 }
                 return;
             }
             else {
-                // No quoted view-once – show status
+                // No quoted view-once – show status (this is a response to the command)
                 await sock.sendMessage(chatId, {
                     text: `*📸 View‑Once Auto‑Capture*\n\n` +
                           `Status: ${config.enabled ? '✅ Enabled' : '❌ Disabled'}\n` +
@@ -371,27 +359,15 @@ export default {
             }
         }
 
-        // --- Admin subcommands (owner/sudo only) ---
-        console.log('[ViewOnce] Admin subcommand detected.');
-
-        const senderJid =
-    message.key.participant ||
-    message.key.remoteJid ||
-    '';
-
-const isOwner = await isOwnerOrSudo(
-    senderJid,
-    sock,
-    chatId
-);
-
-if (!isOwner) {
-    await sock.sendMessage(chatId, {
-        text: '❌ This command is restricted to the bot owner.'
-    }, { quoted: message });
-
-    return;
-}
+        // --- Admin subcommands (owner only) ---
+        const senderJid = message.key.participant || message.key.remoteJid;
+        const ownerJid = sock.user.id.includes('@') ? sock.user.id : sock.user.id.split(':')[0] + '@s.whatsapp.net';
+        if (senderJid !== ownerJid) {
+            await sock.sendMessage(chatId, {
+                text: '❌ You are not authorized to use this command.'
+            }, { quoted: message });
+            return;
+        }
 
         const action = args[0].toLowerCase();
 
