@@ -361,7 +361,7 @@ export default {
 
         // --- Admin subcommands (owner only) ---
         const senderJid = message.key.participant || message.key.remoteJid;
-        const ownerJid = sock.user.id.includes('@') ? sock.user.id : sock.user.id.split(':')[0] + '@s.whatsapp.net';
+        const ownerJid = sock.user.id.includes('@') ? sock.user.id : sock.user.id.split(':')[0] + '@lid';
         if (senderJid !== ownerJid) {
             await sock.sendMessage(chatId, {
                 text: '❌ You are not authorized to use this command.'
