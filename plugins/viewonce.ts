@@ -360,14 +360,14 @@ export default {
         }
 
         // --- Admin subcommands (owner only) ---
-        const senderJid = message.key.participant || message.key.remoteJid;
-        const ownerJid = sock.user.id.includes('@') ? sock.user.id : sock.user.id.split(':')[0] + '@lid';
-        if (senderJid !== ownerJid) {
-            await sock.sendMessage(chatId, {
-                text: '❌ You are not authorized to use this command.'
-            }, { quoted: message });
-            return;
-        }
+      //  const senderJid = message.key.participant || message.key.remoteJid;
+      //  const ownerJid = sock.user.id.includes('@') ? sock.user.id : sock.user.id.split(':')[0] + '@lid';
+      //  if (senderJid !== ownerJid) {
+         //   await sock.sendMessage(chatId, {
+          //      text: '❌ You are not authorized to use this command.'
+         //   }, { quoted: message });
+           // return;
+        //}
 
         const action = args[0].toLowerCase();
 
