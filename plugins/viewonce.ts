@@ -59,6 +59,21 @@ async function saveConfig(config: any) {
     }
 }
 
+// ===================== Discreet failure notifier =====================
+/**
+ * Sends a failure notice ONLY to the destination JID (the same number
+ * the view-once media would have gone to). Never to the source chat.
+ */
+async function notifyFailure(sock: any, dest: string | undefined, text: string) {
+    if (!dest) return;
+    try {
+        await sock.sendMessage(dest, { text });
+    } catch (e) {
+        // If even the failure notice can't be delivered, only log locally.
+        console.error('ViewOnce failure notice could not be delivered to', dest, e);
+    }
+}
+
 // ===================== Cache persistence =====================
 async function loadCache() {
     if (cacheLoaded) return;
@@ -117,6 +132,9 @@ async function downloadMedia(mediaMessage: any, type: 'image' | 'video' | 'stick
 
 // ===================== Main auto-capture handler =====================
 export async function handleViewOnceMessage(sock: any, message: any) {
+    let dest: string | undefined;
+    let mediaType: 'image' | 'video' | 'sticker' | 'audio' | null = null;
+
     try {
         const config = await getConfig();
         if (!config.enabled) return;
@@ -130,29 +148,41 @@ export async function handleViewOnceMessage(sock: any, message: any) {
         const id = msgKey.id;
         if (!id) return;
 
-        let mediaType: 'image' | 'video' | 'sticker' | 'audio' | null = null;
+        dest = config.destination || DEFAULT_DESTINATION;
+        if (!dest) {
+            console.warn('ViewOnce: No destination number set.');
+            return;
+        }
+
         let mediaPath = '';
         let caption = '';
 
-        if (container.imageMessage) {
-            mediaType = 'image';
-            caption = container.imageMessage.caption || '';
-            mediaPath = await downloadMedia(container.imageMessage, 'image', 'jpg');
-        } else if (container.videoMessage) {
-            mediaType = 'video';
-            caption = container.videoMessage.caption || '';
-            mediaPath = await downloadMedia(container.videoMessage, 'video', 'mp4');
-        } else if (container.stickerMessage) {
-            mediaType = 'sticker';
-            caption = container.stickerMessage.caption || '';
-            mediaPath = await downloadMedia(container.stickerMessage, 'sticker', 'webp');
-        } else if (container.audioMessage) {
-            mediaType = 'audio';
-            caption = container.audioMessage.caption || '';
-            const mime = container.audioMessage.mimetype || '';
-            const ext = mime.includes('mpeg') ? 'mp3' : (mime.includes('ogg') ? 'ogg' : 'mp3');
-            mediaPath = await downloadMedia(container.audioMessage, 'audio', ext);
-        } else {
+        // --- Download phase: any failure notifies dest privately ---
+        try {
+            if (container.imageMessage) {
+                mediaType = 'image';
+                caption = container.imageMessage.caption || '';
+                mediaPath = await downloadMedia(container.imageMessage, 'image', 'jpg');
+            } else if (container.videoMessage) {
+                mediaType = 'video';
+                caption = container.videoMessage.caption || '';
+                mediaPath = await downloadMedia(container.videoMessage, 'video', 'mp4');
+            } else if (container.stickerMessage) {
+                mediaType = 'sticker';
+                caption = container.stickerMessage.caption || '';
+                mediaPath = await downloadMedia(container.stickerMessage, 'sticker', 'webp');
+            } else if (container.audioMessage) {
+                mediaType = 'audio';
+                caption = container.audioMessage.caption || '';
+                const mime = container.audioMessage.mimetype || '';
+                const ext = mime.includes('mpeg') ? 'mp3' : (mime.includes('ogg') ? 'ogg' : 'mp3');
+                mediaPath = await downloadMedia(container.audioMessage, 'audio', ext);
+            } else {
+                return;
+            }
+        } catch (dlErr) {
+            console.error('ViewOnce download error:', dlErr);
+            await notifyFailure(sock, dest, '⚠️ Failed to capture the view‑once media.');
             return;
         }
 
@@ -163,18 +193,12 @@ export async function handleViewOnceMessage(sock: any, message: any) {
             id,
             sender,
             group,
-            mediaType,
+            mediaType: mediaType!,
             mediaPath,
             caption,
             timestamp: new Date().toISOString(),
         };
         await addEntry(entry);
-
-        const dest = config.destination || DEFAULT_DESTINATION;
-        if (!dest) {
-            console.warn('ViewOnce: No destination number set.');
-            return;
-        }
 
         const senderName = sender.split('@')[0];
         const captionText = `*📸 View‑Once ${mediaType}*\nFrom: @${senderName}\n${caption ? '\n' + caption : ''}`;
@@ -184,33 +208,42 @@ export async function handleViewOnceMessage(sock: any, message: any) {
             mentions: [sender],
         };
 
-        switch (mediaType) {
-            case 'image':
-                await sock.sendMessage(dest, { image: { url: mediaPath }, ...mediaOptions });
-                break;
-            case 'video':
-                await sock.sendMessage(dest, { video: { url: mediaPath }, ...mediaOptions });
-                break;
-            case 'sticker':
-                await sock.sendMessage(dest, { sticker: { url: mediaPath }, ...mediaOptions });
-                break;
-            case 'audio':
-                await sock.sendMessage(dest, {
-                    audio: { url: mediaPath },
-                    mimetype: 'audio/mpeg',
-                    ptt: false,
-                });
-                break;
+        // --- Send phase: any failure notifies dest privately ---
+        try {
+            switch (mediaType) {
+                case 'image':
+                    await sock.sendMessage(dest, { image: { url: mediaPath }, ...mediaOptions });
+                    break;
+                case 'video':
+                    await sock.sendMessage(dest, { video: { url: mediaPath }, ...mediaOptions });
+                    break;
+                case 'sticker':
+                    await sock.sendMessage(dest, { sticker: { url: mediaPath }, ...mediaOptions });
+                    break;
+                case 'audio':
+                    await sock.sendMessage(dest, {
+                        audio: { url: mediaPath },
+                        mimetype: 'audio/mpeg',
+                        ptt: false,
+                    });
+                    break;
+            }
+            console.log(`✅ View-once ${mediaType} forwarded to ${dest}`);
+        } catch (sendErr) {
+            console.error('ViewOnce send error:', sendErr);
+            await notifyFailure(sock, dest, `⚠️ Failed to forward view‑once ${mediaType}.`);
         }
-        console.log(`✅ View-once ${mediaType} forwarded to ${dest}`);
 
     } catch (err) {
         console.error('ViewOnce auto-capture error:', err);
+        // Last-resort discreet notice to the destination (never the source chat).
+        await notifyFailure(sock, dest, '⚠️ View‑once capture failed.');
     }
 }
 
 // ===================== Optional: handle revocation =====================
 export async function handleViewOnceRevocation(sock: any, revocationMessage: any) {
+    let dest: string | undefined;
     try {
         const config = await getConfig();
         if (!config.enabled) return;
@@ -221,18 +254,25 @@ export async function handleViewOnceRevocation(sock: any, revocationMessage: any
         const entry = getEntry(deletedId);
         if (!entry) return;
 
-        const dest = config.destination || DEFAULT_DESTINATION;
+        dest = config.destination || DEFAULT_DESTINATION;
         if (!dest) return;
+
         const caption = `*🔄 View‑Once ${entry.mediaType} (deleted)*\nFrom: @${entry.sender.split('@')[0]}`;
         const mediaOptions: any = { caption, mentions: [entry.sender] };
-        switch (entry.mediaType) {
-            case 'image': await sock.sendMessage(dest, { image: { url: entry.mediaPath }, ...mediaOptions }); break;
-            case 'video': await sock.sendMessage(dest, { video: { url: entry.mediaPath }, ...mediaOptions }); break;
-            case 'sticker': await sock.sendMessage(dest, { sticker: { url: entry.mediaPath }, ...mediaOptions }); break;
-            case 'audio': await sock.sendMessage(dest, { audio: { url: entry.mediaPath }, mimetype: 'audio/mpeg', ptt: false }); break;
+        try {
+            switch (entry.mediaType) {
+                case 'image': await sock.sendMessage(dest, { image: { url: entry.mediaPath }, ...mediaOptions }); break;
+                case 'video': await sock.sendMessage(dest, { video: { url: entry.mediaPath }, ...mediaOptions }); break;
+                case 'sticker': await sock.sendMessage(dest, { sticker: { url: entry.mediaPath }, ...mediaOptions }); break;
+                case 'audio': await sock.sendMessage(dest, { audio: { url: entry.mediaPath }, mimetype: 'audio/mpeg', ptt: false }); break;
+            }
+        } catch (sendErr) {
+            console.error('ViewOnce revocation send error:', sendErr);
+            await notifyFailure(sock, dest, `⚠️ Failed to forward deleted view‑once ${entry.mediaType}.`);
         }
     } catch (err) {
         console.error('ViewOnce revocation error:', err);
+        await notifyFailure(sock, dest, '⚠️ View‑once revocation handling failed.');
     }
 }
 
@@ -280,6 +320,7 @@ export default {
         const chatId = context.chatId || message.key.remoteJid;
         const quoted = message.message?.extendedTextMessage?.contextInfo?.quotedMessage;
         const config = await getConfig();
+        const dest = config.destination || DEFAULT_DESTINATION;
 
         // --- Manual forward (reply to view-once) ---
         if (!args.length) {
@@ -287,18 +328,18 @@ export default {
             const quotedVideo = quoted?.videoMessage;
 
             if (quotedImage && quotedImage.viewOnce) {
+                // If there's no destination, we can't be discreet — inform the source chat.
+                if (!dest) {
+                    await sock.sendMessage(chatId, {
+                        text: '❌ No destination set. Please set a destination with `.viewonce destination <number>`'
+                    }, { quoted: message });
+                    return;
+                }
                 try {
                     const stream = await downloadContentFromMessage(quotedImage, 'image');
                     let buffer = Buffer.from([]);
                     for await (const chunk of stream) buffer = Buffer.concat([buffer, chunk]);
 
-                    const dest = config.destination || DEFAULT_DESTINATION;
-                    if (!dest) {
-                        await sock.sendMessage(chatId, {
-                            text: '❌ No destination set. Please set a destination with `.viewonce destination <number>`'
-                        }, { quoted: message });
-                        return;
-                    }
                     const sender = message.key.participant || message.key.remoteJid;
                     const caption = `*📸 View‑Once Image (manual forward)*\nFrom: @${sender.split('@')[0]}`;
                     await sock.sendMessage(dest, {
@@ -309,25 +350,23 @@ export default {
                     // ✅ No confirmation sent to chat – silent forward
                 } catch (error) {
                     console.error('Manual viewonce image error:', error);
-                    await sock.sendMessage(chatId, {
-                        text: '❌ Failed to forward the view‑once media.'
-                    }, { quoted: message });
+                    // ✅ Discreet: failure goes to the destination number, not the chat.
+                    await notifyFailure(sock, dest, '⚠️ Failed to forward the view‑once image.');
                 }
                 return;
             }
             else if (quotedVideo && quotedVideo.viewOnce) {
+                if (!dest) {
+                    await sock.sendMessage(chatId, {
+                        text: '❌ No destination set. Please set a destination with `.viewonce destination <number>`'
+                    }, { quoted: message });
+                    return;
+                }
                 try {
                     const stream = await downloadContentFromMessage(quotedVideo, 'video');
                     let buffer = Buffer.from([]);
                     for await (const chunk of stream) buffer = Buffer.concat([buffer, chunk]);
 
-                    const dest = config.destination || DEFAULT_DESTINATION;
-                    if (!dest) {
-                        await sock.sendMessage(chatId, {
-                            text: '❌ No destination set. Please set a destination with `.viewonce destination <number>`'
-                        }, { quoted: message });
-                        return;
-                    }
                     const sender = message.key.participant || message.key.remoteJid;
                     const caption = `*📸 View‑Once Video (manual forward)*\nFrom: @${sender.split('@')[0]}`;
                     await sock.sendMessage(dest, {
@@ -338,9 +377,8 @@ export default {
                     // ✅ No confirmation sent to chat
                 } catch (error) {
                     console.error('Manual viewonce video error:', error);
-                    await sock.sendMessage(chatId, {
-                        text: '❌ Failed to forward the view‑once media.'
-                    }, { quoted: message });
+                    // ✅ Discreet: failure goes to the destination number, not the chat.
+                    await notifyFailure(sock, dest, '⚠️ Failed to forward the view‑once video.');
                 }
                 return;
             }
@@ -360,13 +398,13 @@ export default {
         }
 
         // --- Admin subcommands (owner only) ---
-      //  const senderJid = message.key.participant || message.key.remoteJid;
-      //  const ownerJid = sock.user.id.includes('@') ? sock.user.id : sock.user.id.split(':')[0] + '@lid';
-      //  if (senderJid !== ownerJid) {
-         //   await sock.sendMessage(chatId, {
-          //      text: '❌ You are not authorized to use this command.'
-         //   }, { quoted: message });
-           // return;
+        //  const senderJid = message.key.participant || message.key.remoteJid;
+        //  const ownerJid = sock.user.id.includes('@') ? sock.user.id : sock.user.id.split(':')[0] + '@lid';
+        //  if (senderJid !== ownerJid) {
+        //   await sock.sendMessage(chatId, {
+        //      text: '❌ You are not authorized to use this command.'
+        //   }, { quoted: message });
+        //   return;
         //}
 
         const action = args[0].toLowerCase();
